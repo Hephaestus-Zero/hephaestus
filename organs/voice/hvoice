@@ -1,0 +1,853 @@
+#!/usr/bin/env python3
+"""hvoice: Anti-sycophancy posture frame generator and deterministic prose slop linter."""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import math
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+VERSION = "0.1.0"
+DEFAULT_PROFILE = "peer-engineer"
+MAX_NOTES = 12
+MAX_NOTE_CHARS = 200
+DEFAULT_FRAME_BUDGET_TOKENS = 150
+HARD_CEILING_TOKENS = 159
+
+ANTI_SYCOPHANCY_GATE = (
+    "State trade-offs and flaws before agreeing; never open with hollow praise or contrast cliches."
+)
+
+BUILTIN_PROFILES: dict[str, dict[str, str]] = {
+    "peer-engineer": {
+        "name": "peer-engineer",
+        "summary": "Direct senior peer posture with concrete trade-off analysis and concise prose.",
+        "posture": "Lead with root cause and treat the user as an equal systems engineer.",
+        "pushback": "Surface edge-case failure modes and fragile assumptions before implementing.",
+        "brevity": "Keep prose tight and literal; skip preamble, recap, and sign-off fluff.",
+    },
+    "strict-reviewer": {
+        "name": "strict-reviewer",
+        "summary": "Skeptical code-review posture focused on invariants, failure modes, and regressions.",
+        "posture": "Audit assumptions first and demand reproducible evidence for claims.",
+        "pushback": "Reject workarounds, silent error swallowing, and weakened tests immediately.",
+        "brevity": "Cite exact file:line locations and concrete failure cases in plain sentences.",
+    },
+    "quiet-minimal": {
+        "name": "quiet-minimal",
+        "summary": "Terse, low-token operator posture with minimal commentary.",
+        "posture": "Answer in the fewest accurate sentences possible; let code and output speak.",
+        "pushback": "State flaws in one plain sentence before proceeding without softening cliches.",
+        "brevity": "Prefer 1-3 short sentences over bullet walls; zero pleasantries.",
+    },
+    "architect": {
+        "name": "architect",
+        "summary": "Systems-design posture prioritizing data-flow invariants, boundaries, and simplicity.",
+        "posture": "Evaluate coupling, state ownership, and failure boundaries before adding layers.",
+        "pushback": "Challenge full rewrites or premature abstractions when a boundary fix suffices.",
+        "brevity": "Contrast concrete design options with explicit complexity and debuggability costs.",
+    },
+}
+
+LINT_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
+    (
+        "sycophantic_opener",
+        25,
+        re.compile(
+            r"\b(?:great|fantastic|excellent|wonderful|brilliant)\s+"
+            r"(?:idea|question|point|observation|catch|suggestion)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "sycophantic_opener",
+        25,
+        re.compile(
+            r"\byou(?:\s+are|['\u2019]re)\s+(?:absolutely|completely|totally|entirely|100%)\s+right\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "sycophantic_opener",
+        20,
+        re.compile(
+            r"(?:^\s*|\n\s*)\b(?:certainly|sure\s+thing)\b[!,.:]?|"
+            r"\b(?:certainly|absolutely|of\s+course)\s*!",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "sycophantic_opener",
+        20,
+        re.compile(
+            r"\b(?:(?:i['\u2019]?d\s+be|i\s+would\s+be|i\s+am|i['\u2019]m)\s+)?"
+            r"(?:happy|glad|delighted)\s+to\s+(?:help|assist)\b|"
+            r"\b(?:i['\u2019]?d|i\s+would)\s+be\s+(?:happy|glad)\s+to\b|"
+            r"\bhope\s+this\s+helps\b|"
+            r"\blet\s+me\s+know\s+if\s+you\s+(?:need|have)\s+any(?:thing|\s+other|\s+further)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "contrast_cliche",
+        20,
+        re.compile(
+            r"\b(?:(?:it|this)\s+is\s+not|(?:it|this)['\u2019]s\s+not|(?:it|this)\s+isn['\u2019]t)\s+"
+            r"about\b[^.!?\n,;]{0,50}",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "contrast_cliche",
+        20,
+        re.compile(
+            r"\b(?:not|isn['\u2019]?t)\s+(?:just\s+|merely\s+|only\s+|simply\s+)?"
+            r"[^.!?\n,;]{1,55}?,\s*it['\u2019]?s\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "contrast_cliche",
+        15,
+        re.compile(r"\beveryone\s+talks\s+about\b", re.IGNORECASE),
+    ),
+    (
+        "corporate_filler",
+        15,
+        re.compile(
+            r"\b(?:delve|delves|delving|delved|"
+            r"leverage|leverages|leveraging|leveraged|"
+            r"tapestry|seamlessly|effortlessly|holistically|meticulously|"
+            r"synergy|synergistic|game[- ]changer|paradigm\s+shift|"
+            r"testament\s+to|unlock(?:ing)?\s+the\s+(?:full\s+)?potential|"
+            r"in\s+today['\u2019]?s\s+fast[- ]paced)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "em_dash",
+        10,
+        re.compile(r"\u2014|\s\u2013\s"),
+    ),
+    (
+        "emoji",
+        15,
+        re.compile(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]"),
+    ),
+)
+
+
+def get_hephaestus_home() -> Path:
+    env_home = os.environ.get("HEPHAESTUS_HOME", "").strip()
+    if env_home:
+        return Path(env_home).expanduser()
+    return Path.home() / ".hephaestus"
+
+
+def get_voice_dir() -> Path:
+    return get_hephaestus_home() / "voice"
+
+
+def get_state_path() -> Path:
+    return get_voice_dir() / "state.json"
+
+
+def get_custom_profiles_dir() -> Path:
+    return get_voice_dir() / "profiles"
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_simple_yaml(text: str) -> dict[str, str]:
+    """Minimal stdlib key: value loader for custom profile YAML files."""
+    result: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        k = key.strip().lower()
+        v = val.strip()
+        if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+            v = v[1:-1]
+        if k and v:
+            result[k] = v
+    return result
+
+
+def load_all_profiles() -> dict[str, dict[str, Any]]:
+    profiles: dict[str, dict[str, Any]] = {
+        name: {**spec, "builtin": True} for name, spec in BUILTIN_PROFILES.items()
+    }
+    custom_dir = get_custom_profiles_dir()
+    if custom_dir.is_dir():
+        for entry in sorted(custom_dir.iterdir()):
+            if not entry.is_file():
+                continue
+            ext = entry.suffix.lower()
+            if ext not in (".json", ".yaml", ".yml"):
+                continue
+            try:
+                raw = entry.read_text(encoding="utf-8")
+                data = json.loads(raw) if ext == ".json" else parse_simple_yaml(raw)
+                if not isinstance(data, dict):
+                    continue
+                pname = str(data.get("name") or entry.stem).strip().lower()
+                if not pname:
+                    continue
+                base = BUILTIN_PROFILES[DEFAULT_PROFILE]
+                profiles[pname] = {
+                    "name": pname,
+                    "summary": str(data.get("summary") or "Custom engineering voice profile."),
+                    "posture": str(data.get("posture") or base["posture"]),
+                    "pushback": str(data.get("pushback") or base["pushback"]),
+                    "brevity": str(data.get("brevity") or base["brevity"]),
+                    "builtin": False,
+                }
+            except (OSError, ValueError):
+                continue
+    return profiles
+
+
+def load_state() -> dict[str, Any]:
+    path = get_state_path()
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                prof = str(raw.get("profile") or DEFAULT_PROFILE).strip()
+                raw_notes = raw.get("notes")
+                notes: list[str] = []
+                if isinstance(raw_notes, list):
+                    for item in raw_notes:
+                        if isinstance(item, str) and item.strip():
+                            notes.append(" ".join(item.split()))
+                notes = notes[-MAX_NOTES:]
+                updated_at = str(raw.get("updated_at") or utc_now_iso())
+                return {
+                    "profile": prof,
+                    "notes": notes,
+                    "updated_at": updated_at,
+                }
+        except (OSError, ValueError):
+            pass
+    return {
+        "profile": DEFAULT_PROFILE,
+        "notes": [],
+        "updated_at": utc_now_iso(),
+    }
+
+
+def save_state(profile: str, notes: list[str]) -> dict[str, Any]:
+    path = get_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "profile": profile,
+        "notes": list(notes[-MAX_NOTES:]),
+        "updated_at": utc_now_iso(),
+    }
+    fd, tmp_name = tempfile.mkstemp(prefix=".state.json.tmp.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return payload
+
+
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    words = len(text.split())
+    by_words = math.ceil(words * 1.35)
+    by_chars = math.ceil(len(text) / 3.8)
+    return max(by_words, by_chars)
+
+
+def clip_words(text: str, max_chars: int) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    if max_chars <= 3:
+        return cleaned[:max_chars]
+    cut = cleaned[: max_chars - 3]
+    last_space = cut.rfind(" ")
+    if last_space >= max_chars // 2:
+        cut = cut[:last_space]
+    return cut.rstrip(" ,;:-") + "..."
+
+
+def build_frame(
+    profile_spec: dict[str, Any],
+    notes: list[str],
+    task: str = "",
+    budget_tokens: int = DEFAULT_FRAME_BUDGET_TOKENS,
+) -> tuple[str, int, int]:
+    budget = max(60, min(budget_tokens, HARD_CEILING_TOKENS))
+    pname = profile_spec["name"]
+
+    core_lines = [
+        f'<voice_frame profile="{pname}">',
+        f"posture: {profile_spec['posture']} {profile_spec['brevity']}",
+        f"gate: {ANTI_SYCOPHANCY_GATE}",
+        f"pushback: {profile_spec['pushback']}",
+    ]
+
+    clean_task = clip_words(task, 90) if task.strip() else ""
+    if clean_task:
+        candidate = "\n".join([*core_lines, f"task: {clean_task}", "</voice_frame>"])
+        if estimate_tokens(candidate) <= budget:
+            core_lines.append(f"task: {clean_task}")
+
+    chosen_recent_reversed: list[str] = []
+    for note in reversed(notes):
+        clipped_note = clip_words(note, 72)
+        trial_notes = list(reversed([*chosen_recent_reversed, clipped_note]))
+        note_lines = ["continuity:", *[f"- {n}" for n in trial_notes]]
+        trial_frame = "\n".join([*core_lines, *note_lines, "</voice_frame>"])
+        if estimate_tokens(trial_frame) <= budget:
+            chosen_recent_reversed.append(clipped_note)
+        else:
+            break
+
+    chosen_notes = list(reversed(chosen_recent_reversed))
+    final_lines = list(core_lines)
+    if chosen_notes:
+        final_lines.append("continuity:")
+        for n in chosen_notes:
+            final_lines.append(f"- {n}")
+    final_lines.append("</voice_frame>")
+
+    rendered = "\n".join(final_lines)
+    return rendered, estimate_tokens(rendered), len(chosen_notes)
+
+
+def mask_code_spans(text: str) -> str:
+    """Replace characters inside fenced and inline code spans with spaces, preserving newlines and offsets."""
+    chars = list(text)
+    n = len(chars)
+    i = 0
+
+    while i < n:
+        # Check fenced block at start of string or after newline (allowing indentation)
+        if i == 0 or chars[i - 1] == "\n":
+            j = i
+            while j < n and chars[j] in (" ", "\t"):
+                j += 1
+            if j + 2 < n and chars[j] in ("`", "~") and chars[j + 1] == chars[j] and chars[j + 2] == chars[j]:
+                fence_char = chars[j]
+                fence_len = 0
+                k = j
+                while k < n and chars[k] == fence_char:
+                    fence_len += 1
+                    k += 1
+                # Mask opening fence line and scan until matching closing fence line
+                end_idx = n
+                pos = k
+                while pos < n and chars[pos] != "\n":
+                    pos += 1
+                while pos < n:
+                    line_start = pos + 1
+                    pos = line_start
+                    while pos < n and chars[pos] in (" ", "\t"):
+                        pos += 1
+                    run = 0
+                    while pos < n and chars[pos] == fence_char:
+                        run += 1
+                        pos += 1
+                    if run >= fence_len:
+                        while pos < n and chars[pos] != "\n":
+                            pos += 1
+                        end_idx = pos
+                        break
+                    while pos < n and chars[pos] != "\n":
+                        pos += 1
+                for m in range(i, end_idx):
+                    if chars[m] != "\n":
+                        chars[m] = " "
+                i = end_idx
+                continue
+
+        # Inline backtick code span (single line or short span)
+        if chars[i] == "`":
+            tick_len = 0
+            k = i
+            while k < n and chars[k] == "`":
+                tick_len += 1
+                k += 1
+            close_pos = -1
+            pos = k
+            while pos < n:
+                if chars[pos] == "`":
+                    run = 0
+                    r_start = pos
+                    while pos < n and chars[pos] == "`":
+                        run += 1
+                        pos += 1
+                    if run == tick_len:
+                        close_pos = pos
+                        break
+                    continue
+                pos += 1
+            if close_pos != -1:
+                for m in range(i, close_pos):
+                    if chars[m] != "\n":
+                        chars[m] = " "
+                i = close_pos
+                continue
+            i = k
+            continue
+
+        i += 1
+
+    return "".join(chars)
+
+
+def lint_text(text: str) -> dict[str, Any]:
+    masked = mask_code_spans(text)
+    raw_findings: list[tuple[int, int, str, int, str]] = []
+
+    for rule_name, penalty, pattern in LINT_RULES:
+        for m in pattern.finditer(masked):
+            start, end = m.span()
+            # Trim leading/trailing whitespace from matched slice while updating span accurately
+            orig_slice = text[start:end]
+            lstrip_n = len(orig_slice) - len(orig_slice.lstrip())
+            rstrip_n = len(orig_slice) - len(orig_slice.rstrip())
+            adj_start = start + lstrip_n
+            adj_end = end - rstrip_n if end - rstrip_n > adj_start else end
+            matched_str = text[adj_start:adj_end]
+            raw_findings.append((adj_start, adj_end, rule_name, penalty, matched_str))
+
+    # Sort by start offset, preferring longer spans when tied at the same start.
+    raw_findings.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+
+    deduped: list[dict[str, Any]] = []
+    total_penalty = 0
+    occupied_end = -1
+
+    for start, end, rule_name, penalty, matched_str in raw_findings:
+        if start < occupied_end and deduped and deduped[-1]["rule"] == rule_name:
+            continue
+        line_no = text.count("\n", 0, start) + 1
+        deduped.append(
+            {
+                "rule": rule_name,
+                "match": matched_str,
+                "span": [start, end],
+                "line": line_no,
+            }
+        )
+        total_penalty += penalty
+        occupied_end = max(occupied_end, end)
+
+    score = max(0, 100 - total_penalty)
+    clean = len(deduped) == 0
+    return {
+        "clean": clean,
+        "score": score,
+        "findings": deduped,
+    }
+
+
+def cmd_profiles(args: list[str]) -> int:
+    as_json = False
+    for arg in args:
+        if arg in ("-h", "--help"):
+            print("usage: hvoice profiles [--json]")
+            return 0
+        if arg == "--json":
+            as_json = True
+        else:
+            print(f"hvoice profiles: unknown option '{arg}'", file=sys.stderr)
+            return 2
+
+    state = load_state()
+    active = state["profile"]
+    profiles = load_all_profiles()
+    if active not in profiles:
+        active = DEFAULT_PROFILE
+
+    items = []
+    for name, spec in profiles.items():
+        items.append(
+            {
+                "name": name,
+                "active": name == active,
+                "builtin": bool(spec.get("builtin", True)),
+                "summary": spec["summary"],
+                "posture": spec["posture"],
+                "pushback": spec["pushback"],
+                "brevity": spec["brevity"],
+            }
+        )
+
+    if as_json:
+        print(json.dumps({"active_profile": active, "profiles": items}, indent=2))
+    else:
+        for item in items:
+            marker = "*" if item["active"] else " "
+            tag = "builtin" if item["builtin"] else "custom"
+            print(f"{marker} {item['name']:<17} [{tag}]  {item['summary']}")
+    return 0
+
+
+def cmd_init(args: list[str]) -> int:
+    as_json = False
+    requested_profile: str | None = None
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print("usage: hvoice init [--profile <name>] [--json]")
+            return 0
+        if arg == "--json":
+            as_json = True
+        elif arg == "--profile" and i + 1 < len(args):
+            i += 1
+            requested_profile = args[i].strip().lower()
+        elif arg.startswith("--profile="):
+            requested_profile = arg.split("=", 1)[1].strip().lower()
+        elif not arg.startswith("-") and requested_profile is None:
+            requested_profile = arg.strip().lower()
+        else:
+            print(f"hvoice init: unknown option '{arg}'", file=sys.stderr)
+            return 2
+        i += 1
+
+    profiles = load_all_profiles()
+    existing = load_state()
+    chosen = requested_profile or existing.get("profile") or DEFAULT_PROFILE
+    if chosen not in profiles:
+        valid = ", ".join(profiles.keys())
+        msg = f"Unknown profile '{chosen}'. Available profiles: {valid}"
+        if as_json:
+            print(json.dumps({"error": msg}, indent=2))
+        else:
+            print(f"hvoice init: {msg}", file=sys.stderr)
+        return 2
+
+    saved = save_state(chosen, existing.get("notes", []))
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "initialized": True,
+                    "state_path": str(get_state_path()),
+                    "profile": saved["profile"],
+                    "notes": saved["notes"],
+                    "updated_at": saved["updated_at"],
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"hvoice initialized: profile={saved['profile']} ({len(saved['notes'])} continuity notes)")
+    return 0
+
+
+def cmd_frame(args: list[str]) -> int:
+    as_json = False
+    task = ""
+    override_profile: str | None = None
+    budget = DEFAULT_FRAME_BUDGET_TOKENS
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print('usage: hvoice frame [--task "<focus>"] [--profile <name>] [--budget-tokens <n>] [--json]')
+            return 0
+        if arg == "--json":
+            as_json = True
+        elif arg == "--task" and i + 1 < len(args):
+            i += 1
+            task = args[i]
+        elif arg.startswith("--task="):
+            task = arg.split("=", 1)[1]
+        elif arg == "--profile" and i + 1 < len(args):
+            i += 1
+            override_profile = args[i].strip().lower()
+        elif arg.startswith("--profile="):
+            override_profile = arg.split("=", 1)[1].strip().lower()
+        elif arg == "--budget-tokens" and i + 1 < len(args):
+            i += 1
+            try:
+                budget = int(args[i])
+            except ValueError:
+                print("hvoice frame: --budget-tokens must be an integer", file=sys.stderr)
+                return 2
+        elif arg.startswith("--budget-tokens="):
+            try:
+                budget = int(arg.split("=", 1)[1])
+            except ValueError:
+                print("hvoice frame: --budget-tokens must be an integer", file=sys.stderr)
+                return 2
+        else:
+            print(f"hvoice frame: unknown option '{arg}'", file=sys.stderr)
+            return 2
+        i += 1
+
+    profiles = load_all_profiles()
+    state = load_state()
+    pname = override_profile or state["profile"]
+    if pname not in profiles:
+        pname = DEFAULT_PROFILE
+
+    frame_str, tok_est, notes_used = build_frame(
+        profiles[pname],
+        state["notes"],
+        task=task,
+        budget_tokens=budget,
+    )
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "profile": pname,
+                    "task": task,
+                    "tokens_est": tok_est,
+                    "budget_tokens": min(budget, HARD_CEILING_TOKENS),
+                    "notes_included": notes_used,
+                    "total_notes": len(state["notes"]),
+                    "frame": frame_str,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(frame_str)
+    return 0
+
+
+def cmd_lint(args: list[str]) -> int:
+    as_json = False
+    strict = False
+    text_arg: str | None = None
+    file_arg: str | None = None
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print('usage: hvoice lint [<file> | --text "<str>"] [--strict] [--json]')
+            return 0
+        if arg == "--json":
+            as_json = True
+        elif arg == "--strict":
+            strict = True
+        elif arg == "--text" and i + 1 < len(args):
+            i += 1
+            text_arg = args[i]
+        elif arg.startswith("--text="):
+            text_arg = arg.split("=", 1)[1]
+        elif arg == "--file" and i + 1 < len(args):
+            i += 1
+            file_arg = args[i]
+        elif arg.startswith("--file="):
+            file_arg = arg.split("=", 1)[1]
+        elif arg == "-":
+            file_arg = "-"
+        elif arg.startswith("-"):
+            print(f"hvoice lint: unknown option '{arg}'", file=sys.stderr)
+            return 2
+        else:
+            file_arg = arg
+        i += 1
+
+    if text_arg is not None:
+        content = text_arg
+    elif file_arg == "-":
+        content = sys.stdin.read()
+    elif file_arg is not None:
+        fpath = Path(file_arg)
+        if not fpath.is_file():
+            msg = f"File does not exist: {file_arg}"
+            if as_json:
+                print(json.dumps({"clean": False, "score": 0, "findings": [], "error": msg}, indent=2))
+            else:
+                print(f"hvoice lint: {msg}", file=sys.stderr)
+            return 2
+        try:
+            content = fpath.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            msg = f"Unable to read file '{file_arg}': {exc}"
+            if as_json:
+                print(json.dumps({"clean": False, "score": 0, "findings": [], "error": msg}, indent=2))
+            else:
+                print(f"hvoice lint: {msg}", file=sys.stderr)
+            return 2
+    else:
+        print("hvoice lint: provide either <file> or --text \"<str>\"", file=sys.stderr)
+        return 2
+
+    report = lint_text(content)
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        if report["clean"]:
+            print(f"hvoice lint: CLEAN (score={report['score']}/100, 0 findings)")
+        else:
+            print(f"hvoice lint: FLAGGED (score={report['score']}/100, {len(report['findings'])} finding(s))")
+            for f in report["findings"]:
+                print(f"  - line {f['line']} [{f['rule']}]: {f['match']!r} (span {f['span'][0]}..{f['span'][1]})")
+
+    if strict and not report["clean"]:
+        return 1
+    return 0
+
+
+def cmd_note(args: list[str]) -> int:
+    as_json = False
+    clear = False
+    list_only = False
+    parts: list[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print('usage: hvoice note "<observation>" [--list] [--clear] [--json]')
+            return 0
+        if arg == "--json":
+            as_json = True
+        elif arg == "--clear":
+            clear = True
+        elif arg == "--list":
+            list_only = True
+        elif arg.startswith("-"):
+            print(f"hvoice note: unknown option '{arg}'", file=sys.stderr)
+            return 2
+        else:
+            parts.append(arg)
+        i += 1
+
+    state = load_state()
+    if clear:
+        saved = save_state(state["profile"], [])
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "profile": saved["profile"],
+                        "notes_count": 0,
+                        "max_notes": MAX_NOTES,
+                        "notes": [],
+                        "updated_at": saved["updated_at"],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print("hvoice note: cleared continuity ring")
+        return 0
+
+    if list_only and not parts:
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "profile": state["profile"],
+                        "notes_count": len(state["notes"]),
+                        "max_notes": MAX_NOTES,
+                        "notes": state["notes"],
+                        "updated_at": state["updated_at"],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            for idx, n in enumerate(state["notes"], 1):
+                print(f"{idx}. {n}")
+        return 0
+
+    observation = clip_words(" ".join(parts), MAX_NOTE_CHARS)
+    if not observation:
+        print('hvoice note: missing required "<observation>" text', file=sys.stderr)
+        return 2
+
+    existing_notes = [n for n in state["notes"] if n.lower() != observation.lower()]
+    existing_notes.append(observation)
+    bounded = existing_notes[-MAX_NOTES:]
+    saved = save_state(state["profile"], bounded)
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "profile": saved["profile"],
+                    "note": observation,
+                    "notes_count": len(saved["notes"]),
+                    "max_notes": MAX_NOTES,
+                    "notes": saved["notes"],
+                    "updated_at": saved["updated_at"],
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"hvoice note recorded ({len(saved['notes'])}/{MAX_NOTES}): {observation}")
+    return 0
+
+
+def print_help() -> None:
+    text = f"""hvoice {VERSION} - Anti-sycophancy engineering posture and prose slop linter
+
+usage:
+  hvoice profiles [--json]
+  hvoice init [--profile <name>] [--json]
+  hvoice frame [--task "<focus>"] [--profile <name>] [--json]
+  hvoice lint [<file> | --text "<str>"] [--strict] [--json]
+  hvoice note "<observation>" [--list] [--clear] [--json]
+  hvoice --version | --help
+"""
+    print(text.rstrip())
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in ("-h", "--help", "help"):
+        print_help()
+        return 0
+    if args[0] in ("-V", "--version", "version"):
+        print(f"hvoice {VERSION}")
+        return 0
+
+    sub = args[0]
+    rest = args[1:]
+    if sub == "profiles":
+        return cmd_profiles(rest)
+    if sub == "init":
+        return cmd_init(rest)
+    if sub == "frame":
+        return cmd_frame(rest)
+    if sub == "lint":
+        return cmd_lint(rest)
+    if sub == "note":
+        return cmd_note(rest)
+
+    print(
+        f"hvoice: unknown subcommand '{sub}' (expected profiles, init, frame, lint, or note)",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

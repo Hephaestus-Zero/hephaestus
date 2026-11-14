@@ -1,0 +1,14 @@
+build/
+dist/
+__pycache__/
+*.py[cod]
+*.o
+*.a
+*.so
+*.dylib
+*.idx
+.hephaestus-verify.json
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store

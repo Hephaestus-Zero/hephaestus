@@ -1,0 +1,14 @@
+{
+  "name": "hephaestus-zero",
+  "owner": {
+    "name": "Hephaestus-Zero",
+    "url": "https://github.com/Hephaestus-Zero"
+  },
+  "plugins": [
+    {
+      "name": "hephaestus",
+      "source": "./",
+      "description": "Modular C11 and SQLite systems spine for AI coding agents (slice, shield, verify, memory, voice)"
+    }
+  ]
+}

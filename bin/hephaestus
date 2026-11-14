@@ -1,0 +1,1319 @@
+#!/usr/bin/env python3
+"""hephaestus: Unified CLI dispatcher for the modular C11 & SQLite agent spine."""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import ctypes
+import json
+import os
+import platform
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+VERSION = "0.1.0"
+ALL_ORGANS: tuple[str, ...] = ("slice", "shield", "verify", "memory", "voice")
+
+ORGAN_SPECS: dict[str, dict[str, Any]] = {
+    "slice": {
+        "binaries": ("hslice", "hfind", "hsearch"),
+        "primary": "hslice",
+        "mcp_tools": ("slice_symbol", "slice_outline", "find_files", "search_code"),
+        "summary": "mmap trigram search + structural AST symbol slicer",
+    },
+    "shield": {
+        "binaries": ("hshield", "hhook"),
+        "primary": "hshield",
+        "mcp_tools": ("shield_audit", "hook_check_command"),
+        "summary": "Landlock LSM sandbox, repo trap & Pickle VM auditor, shell gate",
+    },
+    "verify": {
+        "binaries": ("hverify",),
+        "primary": "hverify",
+        "mcp_tools": ("verify_snapshot", "verify_check"),
+        "summary": "O_NOFOLLOW SHA-256 + assertion-count anti-tamper verifier",
+    },
+    "memory": {
+        "binaries": ("hmemory",),
+        "primary": "hmemory",
+        "mcp_tools": (
+            "memory_ingest",
+            "memory_query",
+            "memory_context",
+            "memory_link",
+            "memory_explain",
+        ),
+        "summary": "SQLite WAL + FTS5 cognitive memory with JTMS supersession",
+    },
+    "voice": {
+        "binaries": ("hvoice",),
+        "primary": "hvoice",
+        "mcp_tools": ("voice_frame", "voice_lint", "voice_note"),
+        "summary": "stateful engineering posture + deterministic anti-slop linter",
+    },
+}
+
+PASSTHROUGH_MAP: dict[str, tuple[str, str]] = {
+    "slice": ("slice", "hslice"),
+    "find": ("slice", "hfind"),
+    "search": ("slice", "hsearch"),
+    "shield": ("shield", "hshield"),
+    "hook": ("shield", "hhook"),
+    "verify": ("verify", "hverify"),
+    "memory": ("memory", "hmemory"),
+    "voice": ("voice", "hvoice"),
+}
+
+RULE = "\u2500" * 80
+
+
+def _clip_loc(loc: str, width: int = 31) -> str:
+    if len(loc) <= width:
+        return loc
+    if ":" in loc:
+        path_part, line_part = loc.rsplit(":", 1)
+        suffix = f":{line_part}"
+        keep = width - len(suffix) - 3
+        if keep > 4:
+            return f"...{path_part[-keep:]}{suffix}"
+    return f"...{loc[-(width - 3):]}"
+
+
+def get_hephaestus_home() -> Path:
+    env_home = os.environ.get("HEPHAESTUS_HOME", "").strip()
+    if env_home:
+        return Path(env_home).expanduser()
+    return Path.home() / ".hephaestus"
+
+
+def get_config_path() -> Path:
+    return get_hephaestus_home() / "config.json"
+
+
+def _normalize_organs(raw: list[str] | tuple[str, ...]) -> list[str]:
+    seen = {x.strip().lower() for x in raw if isinstance(x, str)}
+    return [o for o in ALL_ORGANS if o in seen]
+
+
+def load_config() -> dict[str, Any]:
+    cfg_path = get_config_path()
+    if cfg_path.is_file():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                enabled = data.get("enabled_organs")
+                if isinstance(enabled, list):
+                    data["enabled_organs"] = _normalize_organs(enabled)
+                else:
+                    data["enabled_organs"] = list(ALL_ORGANS)
+                data.setdefault("version", VERSION)
+                return data
+        except (OSError, ValueError):
+            pass
+    return {
+        "version": VERSION,
+        "enabled_organs": list(ALL_ORGANS),
+    }
+
+
+def save_config(cfg: dict[str, Any]) -> Path:
+    cfg_path = get_config_path()
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(cfg)
+    payload["version"] = VERSION
+    payload["enabled_organs"] = _normalize_organs(payload.get("enabled_organs", list(ALL_ORGANS)))
+    tmp_path = cfg_path.parent / f".config.json.tmp.{os.getpid()}"
+    tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, cfg_path)
+    return cfg_path
+
+
+def _detect_repo_root() -> Path | None:
+    # Do not resolve symlink basename of argv[0], but locate script layout cleanly
+    script_file = Path(__file__).resolve()
+    # Case 1: <repo>/bin/hephaestus
+    cand1 = script_file.parent.parent
+    if (cand1 / "organs").is_dir() and (cand1 / "mcp" / "hephaestus_mcp.py").is_file():
+        return cand1
+    # Case 2: <repo>/build/bin/hephaestus
+    cand2 = script_file.parent.parent.parent
+    if (cand2 / "organs").is_dir() and (cand2 / "mcp" / "hephaestus_mcp.py").is_file():
+        return cand2
+    return None
+
+
+def _is_executable(path: Path) -> bool:
+    # Keep symlink awareness: os.access follows symlinks to check target X_OK,
+    # while caller retains `path` (preserving `hsearch` basename).
+    return os.path.lexists(path) and os.path.exists(path) and not path.is_dir() and os.access(path, os.X_OK)
+
+
+def resolve_binary(name: str) -> str | None:
+    env_bin = os.environ.get("HEPHAESTUS_BIN_DIR", "").strip()
+    if env_bin:
+        cand = Path(env_bin) / name
+        return str(cand) if _is_executable(cand) else None
+
+    repo_root = _detect_repo_root()
+    if repo_root is not None:
+        build_cand = repo_root / "build" / "bin" / name
+        if _is_executable(build_cand):
+            return str(build_cand)
+        if name == "hverify":
+            src_cand = repo_root / "organs" / "verify" / "hverify"
+            if _is_executable(src_cand):
+                return str(src_cand)
+        if name == "hvoice":
+            src_cand = repo_root / "organs" / "voice" / "hvoice"
+            if _is_executable(src_cand):
+                return str(src_cand)
+        if os.environ.get("HEPHAESTUS_PATH_FALLBACK") == "1":
+            return shutil.which(name)
+        return None
+
+    script_dir = Path(os.path.abspath(__file__)).parent
+    sibling = script_dir / name
+    if _is_executable(sibling):
+        return str(sibling)
+
+    # Check if any organ binary is installed alongside `hephaestus` in script_dir.
+    # If so, `script_dir` is an isolated prefix install (--only); do not leak global PATH binaries.
+    all_bin_names = [b for spec in ORGAN_SPECS.values() for b in spec["binaries"]]
+    has_any_sibling = any(_is_executable(script_dir / b) for b in all_bin_names)
+    if has_any_sibling and os.environ.get("HEPHAESTUS_PATH_FALLBACK") != "1":
+        return None
+
+    return shutil.which(name)
+
+
+def resolve_mcp_server() -> str | None:
+    env_mcp = os.environ.get("HEPHAESTUS_MCP_PATH", "").strip()
+    if env_mcp and Path(env_mcp).is_file():
+        return str(Path(env_mcp).resolve())
+
+    repo_root = _detect_repo_root()
+    if repo_root is not None:
+        cand = repo_root / "mcp" / "hephaestus_mcp.py"
+        if cand.is_file():
+            return str(cand)
+
+    script_dir = Path(os.path.abspath(__file__)).parent
+    candidates = [
+        script_dir.parent / "share" / "hephaestus" / "mcp" / "hephaestus_mcp.py",
+        script_dir.parent / "libexec" / "hephaestus" / "hephaestus_mcp.py",
+        script_dir / "hephaestus_mcp.py",
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+def resolve_skills_root() -> Path | None:
+    repo_root = _detect_repo_root()
+    if repo_root is not None and (repo_root / "skills").is_dir():
+        return repo_root / "skills"
+    script_dir = Path(os.path.abspath(__file__)).parent
+    cand = script_dir.parent / "share" / "hephaestus" / "skills"
+    if cand.is_dir():
+        return cand
+    return None
+
+
+def build_organ_env() -> dict[str, str]:
+    env = os.environ.copy()
+    home = get_hephaestus_home()
+    env["HEPHAESTUS_HOME"] = str(home)
+    if "HEPHAESTUS_HOME" in os.environ:
+        env.setdefault("HEPHAESTUS_MEMORY_DB", str(home / "memory" / "memory.db"))
+        env.setdefault("HEPHAESTUS_CACHE_DIR", str(home / "cache"))
+    return env
+
+
+def resolve_memory_db_path(env: dict[str, str]) -> Path:
+    if env.get("HEPHAESTUS_MEMORY_DB"):
+        return Path(env["HEPHAESTUS_MEMORY_DB"]).expanduser()
+    xdg = env.get("XDG_DATA_HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser() / "hephaestus" / "memory.db"
+    return get_hephaestus_home() / "memory" / "memory.db"
+
+
+def probe_landlock() -> dict[str, Any]:
+    sys_name = sys.platform
+    if not sys_name.startswith("linux"):
+        return {
+            "platform": sys_name,
+            "landlock_supported": False,
+            "landlock_abi": 0,
+            "mode": "posix-audit",
+            "label": "posix static + pickle vm audit",
+        }
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+        # __NR_landlock_create_ruleset = 444 across unified Linux arches (x86_64, aarch64, riscv64)
+        abi = syscall(
+            ctypes.c_long(444),
+            ctypes.c_void_p(0),
+            ctypes.c_size_t(0),
+            ctypes.c_uint32(1),
+        )
+        if abi >= 1:
+            return {
+                "platform": "linux",
+                "landlock_supported": True,
+                "landlock_abi": int(abi),
+                "mode": "landlock-lsm",
+                "label": f"landlock abi v{int(abi)}",
+            }
+    except Exception:
+        pass
+    return {
+        "platform": "linux",
+        "landlock_supported": False,
+        "landlock_abi": 0,
+        "mode": "posix-audit",
+        "label": "landlock disabled (static audit active)",
+    }
+
+
+def probe_sqlite() -> dict[str, Any]:
+    ver = sqlite3.sqlite_version
+    fts5 = False
+    try:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE VIRTUAL TABLE fts_probe USING fts5(content)")
+        conn.close()
+        fts5 = True
+    except sqlite3.Error:
+        fts5 = False
+    return {
+        "available": True,
+        "version": ver,
+        "fts5": fts5,
+        "label": f"sqlite {ver} wal+fts5" if fts5 else f"sqlite {ver} (no fts5)",
+    }
+
+
+def _run_quick(
+    cmd: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, str, str, float]:
+    t0 = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        dt = (time.perf_counter() - t0) * 1000.0
+        return proc.returncode, proc.stdout, proc.stderr, dt
+    except FileNotFoundError as exc:
+        dt = (time.perf_counter() - t0) * 1000.0
+        return 127, "", str(exc), dt
+    except subprocess.TimeoutExpired:
+        dt = (time.perf_counter() - t0) * 1000.0
+        return 124, "", "command timed out", dt
+
+
+def _parse_organ_args(args: list[str]) -> tuple[list[str], bool, bool]:
+    only = False
+    as_json = False
+    tokens: list[str] = []
+    for arg in args:
+        if arg == "--only":
+            only = True
+        elif arg == "--json":
+            as_json = True
+        elif arg.startswith("-"):
+            raise ValueError(f"Unknown option: {arg}")
+        else:
+            for part in arg.split(","):
+                part = part.strip().lower()
+                if part:
+                    tokens.append(part)
+    expanded: list[str] = []
+    for tok in tokens:
+        if tok == "all":
+            expanded.extend(ALL_ORGANS)
+        elif tok in ALL_ORGANS:
+            expanded.append(tok)
+        else:
+            valid = ", ".join(ALL_ORGANS)
+            raise ValueError(f"Unknown organ '{tok}'. Valid organs: {valid}, all")
+    return _normalize_organs(expanded), only, as_json
+
+
+def collect_doctor_report(run_latency_probes: bool = True) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    cfg = load_config()
+    enabled = set(cfg["enabled_organs"])
+    ll_info = probe_landlock()
+    sq_info = probe_sqlite()
+    mcp_path = resolve_mcp_server()
+    env = build_organ_env()
+
+    organs_report: dict[str, Any] = {}
+    all_enabled_healthy = True
+    active_mcp_tools = 0
+
+    probe_results: dict[str, tuple[int, str, str, float]] = {}
+    if run_latency_probes:
+        probe_targets: dict[str, str] = {}
+        for organ in ALL_ORGANS:
+            p = resolve_binary(ORGAN_SPECS[organ]["primary"])
+            if p:
+                probe_targets[organ] = p
+        if probe_targets:
+            def _probe_one(item: tuple[str, str]) -> tuple[str, tuple[int, str, str, float]]:
+                org, bpath = item
+                res = _run_quick([bpath, "--version"], env=env, timeout=2.5)
+                if res[0] != 0:
+                    res = _run_quick([bpath, "--help"], env=env, timeout=2.5)
+                return org, res
+
+            with ThreadPoolExecutor(max_workers=len(probe_targets)) as pool:
+                for org, res in pool.map(_probe_one, probe_targets.items()):
+                    probe_results[org] = res
+
+    for organ in ALL_ORGANS:
+        spec = ORGAN_SPECS[organ]
+        is_enabled = organ in enabled
+        if is_enabled:
+            active_mcp_tools += len(spec["mcp_tools"])
+
+        bins_info: dict[str, Any] = {}
+        missing_bins: list[str] = []
+        for bname in spec["binaries"]:
+            bpath = resolve_binary(bname)
+            bins_info[bname] = bpath
+            if not bpath:
+                missing_bins.append(bname)
+
+        probe_ok = len(missing_bins) == 0
+        latency_ms: float | None = None
+        version_text = ""
+
+        if organ in probe_results:
+            rc, out, err, dt = probe_results[organ]
+            latency_ms = round(dt, 2)
+            probe_ok = probe_ok and (rc == 0)
+            first_line = (out.strip() or err.strip()).splitlines()
+            if first_line:
+                version_text = first_line[0][:80]
+
+        if is_enabled and not probe_ok:
+            all_enabled_healthy = False
+
+        if organ == "slice":
+            posture = "mmap trigram + ast"
+        elif organ == "shield":
+            posture = ll_info["label"]
+        elif organ == "verify":
+            posture = "o_nofollow sha256"
+        elif organ == "memory":
+            posture = sq_info["label"]
+        else:
+            posture = "stateful anti-slop"
+
+        organs_report[organ] = {
+            "organ": organ,
+            "enabled": is_enabled,
+            "installed": len(missing_bins) == 0,
+            "healthy": probe_ok,
+            "binaries": bins_info,
+            "missing_binaries": missing_bins,
+            "latency_ms": latency_ms,
+            "version": version_text,
+            "posture": posture,
+            "mcp_tool_count": len(spec["mcp_tools"]),
+            "summary": spec["summary"],
+        }
+
+    if is_mcp_missing := (mcp_path is None):
+        all_enabled_healthy = False
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    plat_tag = f"{platform.system().lower()}-{platform.machine().lower()}"
+
+    return {
+        "version": VERSION,
+        "platform": plat_tag,
+        "hephaestus_home": str(get_hephaestus_home()),
+        "config_path": str(get_config_path()),
+        "enabled_organs": cfg["enabled_organs"],
+        "healthy": bool(all_enabled_healthy and sq_info["available"] and not is_mcp_missing),
+        "sqlite": sq_info,
+        "kernel": ll_info,
+        "mcp": {
+            "available": mcp_path is not None,
+            "path": mcp_path,
+            "active_tools": active_mcp_tools,
+        },
+        "organs": organs_report,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def render_doctor_table(rep: dict[str, Any], mode: str = "doctor") -> str:
+    lines: list[str] = []
+    lines.append(f"hephaestus {mode}  v{rep['version']}  {rep['platform']}")
+    lines.append(RULE)
+    lines.append(f"{'organ':<9} {'state':<10} {'binaries':<26} {'posture':<23} {'latency':>6}")
+    lines.append(RULE)
+    for organ in ALL_ORGANS:
+        info = rep["organs"][organ]
+        if info["enabled"]:
+            state = "enabled" if info["healthy"] else "missing"
+        else:
+            state = "disabled"
+        bnames = ", ".join(ORGAN_SPECS[organ]["binaries"])
+        lat = f"{info['latency_ms']:.1f} ms" if info["latency_ms"] is not None else "n/a"
+        lines.append(f"{organ:<9} {state:<10} {bnames:<26} {info['posture'][:23]:<23} {lat:>6}")
+    lines.append(RULE)
+    mcp_info = rep["mcp"]
+    enabled_n = len(rep["enabled_organs"])
+    mcp_state = "ready" if mcp_info["available"] else "missing"
+    lines.append(
+        f"mcp       {mcp_state:<10} {mcp_info['active_tools']} tools exposed ({enabled_n}/{len(ALL_ORGANS)} organs enabled)"
+    )
+    verdict = "healthy" if rep["healthy"] else "degraded"
+    lines.append(
+        f"status    {verdict:<10} home: {rep['hephaestus_home']}  \u00b7  elapsed: {rep['elapsed_ms']:.1f} ms"
+    )
+    return "\n".join(lines)
+
+
+def cmd_organs(args: list[str]) -> int:
+    as_json = "--json" in args
+    rep = collect_doctor_report(run_latency_probes=False)
+    if as_json:
+        out = {
+            "version": VERSION,
+            "hephaestus_home": rep["hephaestus_home"],
+            "enabled_organs": rep["enabled_organs"],
+            "organs": [rep["organs"][o] for o in ALL_ORGANS],
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    lines = [
+        f"hephaestus organs  ({len(rep['enabled_organs'])}/{len(ALL_ORGANS)} enabled)",
+        RULE,
+        f"{'organ':<9} {'state':<10} {'mcp':<8} {'role'}",
+        RULE,
+    ]
+    for o in ALL_ORGANS:
+        info = rep["organs"][o]
+        st = "enabled" if info["enabled"] else "disabled"
+        tools_str = f"{info['mcp_tool_count']} tools"
+        lines.append(f"{o:<9} {st:<10} {tools_str:<8} {info['summary']}")
+    lines.append(RULE)
+    print("\n".join(lines))
+    return 0
+
+
+def cmd_toggle(args: list[str], enable: bool) -> int:
+    if not args or "-h" in args or "--help" in args:
+        verb = "enable" if enable else "disable"
+        extra = " [--only]" if enable else ""
+        print(f"usage: hephaestus {verb} <organ...>{extra} [--json]")
+        print(f"organs: {', '.join(ALL_ORGANS)}, all")
+        return 0 if ("-h" in args or "--help" in args) else 2
+
+    try:
+        targets, only, as_json = _parse_organ_args(args)
+    except ValueError as exc:
+        print(f"hephaestus: {exc}", file=sys.stderr)
+        return 2
+
+    if not targets:
+        print("hephaestus: specify at least one organ", file=sys.stderr)
+        return 2
+
+    cfg = load_config()
+    cur = set(cfg["enabled_organs"])
+    if enable:
+        new_set = set(targets) if only else (cur | set(targets))
+    else:
+        if only:
+            print("hephaestus: --only is supported with 'enable', not 'disable'", file=sys.stderr)
+            return 2
+        new_set = cur - set(targets)
+
+    cfg["enabled_organs"] = [o for o in ALL_ORGANS if o in new_set]
+    cfg_path = save_config(cfg)
+
+    active_tools = sum(len(ORGAN_SPECS[o]["mcp_tools"]) for o in cfg["enabled_organs"])
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "config_path": str(cfg_path),
+                    "enabled_organs": cfg["enabled_organs"],
+                    "active_mcp_tools": active_tools,
+                },
+                indent=2,
+            )
+        )
+    else:
+        enabled_str = ", ".join(cfg["enabled_organs"]) if cfg["enabled_organs"] else "none"
+        print(f"enabled organs: {enabled_str}  ({active_tools} mcp tools)  [{cfg_path}]")
+    return 0
+
+
+def _try_json(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        val = json.loads(stripped)
+        return val if isinstance(val, dict) else None
+    except ValueError:
+        return None
+
+
+def _pick_int(d: dict[str, Any], keys: tuple[str, ...], default: int = 0) -> int:
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            return int(v)
+    return default
+
+
+def _pick_float(d: dict[str, Any], keys: tuple[str, ...], default: float = 0.0) -> float:
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            return float(v)
+    return default
+
+
+def _audit_slice(target_dir: Path, env: dict[str, str]) -> dict[str, Any]:
+    hslice = resolve_binary("hslice")
+    if not hslice:
+        return {"available": False}
+
+    # Try --json first, then plain --audit text so we capture exact numbers and top symbols
+    rc_j, out_j, _, dt_j = _run_quick([hslice, "--audit", str(target_dir), "--json"], env=env, timeout=15.0)
+    parsed = _try_json(out_j) if rc_j == 0 else None
+
+    files_n = 0
+    symbols_n = 0
+    file_tok = 0
+    slice_tok = 0
+    saved_pct = 0.0
+    density = 0.0
+    top_symbols: list[dict[str, Any]] = []
+
+    if parsed:
+        files_n = _pick_int(parsed, ("files", "file_count", "indexed_files", "total_files"))
+        symbols_n = _pick_int(parsed, ("symbols", "symbol_count", "indexed_symbols", "total_symbols"))
+        file_tok = _pick_int(
+            parsed,
+            (
+                "total_file_tokens",
+                "all_file_tokens",
+                "file_tokens",
+                "raw_tokens",
+                "baseline_tokens",
+            ),
+        )
+        slice_tok = _pick_int(
+            parsed,
+            (
+                "total_slice_tokens",
+                "all_slice_tokens",
+                "slice_tokens",
+                "sliced_tokens",
+            ),
+        )
+        saved_pct = _pick_float(parsed, ("saved_pct", "savings_pct", "context_saved_pct", "reduction_pct"))
+        density = _pick_float(parsed, ("density", "density_x", "compression_ratio"))
+
+        # Check nested totals if present
+        totals_sub = parsed.get("totals") or parsed.get("summary")
+        if isinstance(totals_sub, dict):
+            files_n = files_n or _pick_int(totals_sub, ("files", "file_count", "total_files"))
+            symbols_n = symbols_n or _pick_int(totals_sub, ("symbols", "symbol_count", "total_symbols"))
+            file_tok = file_tok or _pick_int(totals_sub, ("file_tokens", "total_file_tokens", "raw_tokens"))
+            slice_tok = slice_tok or _pick_int(totals_sub, ("slice_tokens", "total_slice_tokens"))
+            saved_pct = saved_pct or _pick_float(totals_sub, ("saved_pct", "savings_pct", "context_saved_pct"))
+            density = density or _pick_float(totals_sub, ("density", "density_x"))
+
+        raw_top = parsed.get("top_symbols") or parsed.get("sample") or parsed.get("largest_symbols") or []
+        if isinstance(raw_top, list):
+            for item in raw_top[:5]:
+                if isinstance(item, dict):
+                    ft = _pick_int(item, ("file_tokens", "file_tok", "raw_tokens"))
+                    st = _pick_int(item, ("slice_tokens", "slice_tok", "tokens"))
+                    sp = _pick_float(item, ("saved_pct", "saved", "savings_pct"))
+                    if sp == 0.0 and ft > 0:
+                        sp = round((1.0 - (st / ft)) * 100.0, 1)
+                    loc = str(item.get("location") or "")
+                    if not loc and item.get("file"):
+                        line_no = item.get("line") or item.get("start_line")
+                        loc = f"{item['file']}:{line_no}" if line_no else str(item["file"])
+                    top_symbols.append(
+                        {
+                            "symbol": str(item.get("symbol") or item.get("name") or "unknown"),
+                            "location": loc,
+                            "file_tokens": ft,
+                            "slice_tokens": st,
+                            "saved_pct": sp,
+                        }
+                    )
+
+    # Fallback / supplement from text `hslice --audit <dir>` if JSON wasn't supported or lacked fields
+    if not parsed or (symbols_n == 0 and file_tok == 0):
+        rc_t, out_t, _, dt_t = _run_quick([hslice, "--audit", str(target_dir)], env=env, timeout=15.0)
+        dt_j = dt_t
+        if rc_t == 0 and out_t:
+            m_hdr = re.search(r"\((\d+)\s+files?,\s*(\d+)\s+symbols?\)", out_t)
+            if m_hdr:
+                files_n = int(m_hdr.group(1))
+                symbols_n = int(m_hdr.group(2))
+            m_all = re.search(
+                r"all\s+(\d+)\s+indexed\s+symbols\s+([\d,]+)\s+([\d,]+)\s+([\d.]+)%",
+                out_t,
+            )
+            if m_all:
+                symbols_n = symbols_n or int(m_all.group(1))
+                file_tok = int(m_all.group(2).replace(",", ""))
+                slice_tok = int(m_all.group(3).replace(",", ""))
+                saved_pct = float(m_all.group(4))
+            m_den = re.search(r"density:\s*([\d.]+)x", out_t)
+            if m_den:
+                density = float(m_den.group(1))
+            if not top_symbols:
+                row_re = re.compile(r"^(\S+)\s+(\S+:\d+)\s+([\d,]+)\s+([\d,]+)\s+([\d.]+)%$")
+                for line in out_t.splitlines():
+                    m_row = row_re.match(line.strip())
+                    if m_row and len(top_symbols) < 5:
+                        top_symbols.append(
+                            {
+                                "symbol": m_row.group(1),
+                                "location": m_row.group(2),
+                                "file_tokens": int(m_row.group(3).replace(",", "")),
+                                "slice_tokens": int(m_row.group(4).replace(",", "")),
+                                "saved_pct": float(m_row.group(5)),
+                            }
+                        )
+
+    if saved_pct == 0.0 and file_tok > 0 and slice_tok >= 0:
+        saved_pct = round((1.0 - (slice_tok / file_tok)) * 100.0, 1)
+    if density == 0.0 and slice_tok > 0 and file_tok > 0:
+        density = round(file_tok / slice_tok, 1)
+
+    return {
+        "available": True,
+        "files": files_n,
+        "symbols": symbols_n,
+        "file_tokens": file_tok,
+        "slice_tokens": slice_tok,
+        "saved_pct": round(saved_pct, 1),
+        "density_x": round(density, 1),
+        "top_symbols": top_symbols,
+        "elapsed_ms": round(dt_j, 2),
+    }
+
+
+def _audit_shield(target_dir: Path, env: dict[str, str], ll_info: dict[str, Any]) -> dict[str, Any]:
+    hshield = resolve_binary("hshield")
+    if not hshield:
+        return {"available": False, "posture": ll_info["label"]}
+
+    rc, out, err, dt = _run_quick([hshield, "audit", str(target_dir), "--json"], env=env, timeout=15.0)
+    parsed = _try_json(out)
+    if parsed is None:
+        rc, out, err, dt = _run_quick([hshield, "audit", str(target_dir)], env=env, timeout=15.0)
+        parsed = _try_json(out)
+
+    findings_count = 0
+    scanned_files = 0
+    clean = rc == 0
+
+    if parsed:
+        raw_f = parsed.get("findings")
+        if isinstance(raw_f, list):
+            findings_count = len(raw_f)
+        else:
+            findings_count = _pick_int(
+                parsed,
+                ("finding_count", "findings_count", "issues", "warnings", "traps", "total_findings"),
+            )
+        scanned_files = _pick_int(parsed, ("scanned_files", "files_scanned", "files", "checked_files"))
+        if "clean" in parsed and isinstance(parsed["clean"], bool):
+            clean = parsed["clean"]
+        elif "passed" in parsed and isinstance(parsed["passed"], bool):
+            clean = parsed["passed"]
+        else:
+            clean = findings_count == 0 and rc == 0
+    else:
+        combined = f"{out}\n{err}"
+        m_f = re.search(r"(\d+)\s+(?:finding|trap|issue|warning)s?", combined, re.IGNORECASE)
+        if m_f:
+            findings_count = int(m_f.group(1))
+        elif rc != 0:
+            findings_count = 1
+        clean = findings_count == 0 and rc == 0
+
+    return {
+        "available": True,
+        "clean": clean,
+        "findings": findings_count,
+        "scanned_files": scanned_files,
+        "posture": ll_info["label"],
+        "elapsed_ms": round(dt, 2),
+    }
+
+
+def _audit_verify(target_dir: Path, env: dict[str, str]) -> dict[str, Any]:
+    hverify = resolve_binary("hverify")
+    if not hverify:
+        return {"available": False}
+
+    # Write snapshot manifest inside an ephemeral temp directory so target_dir stays 100% untouched
+    with tempfile.TemporaryDirectory(prefix="heph-verify-") as tmpdir:
+        manifest_out = os.path.join(tmpdir, "snapshot.json")
+        rc, out, _, dt = _run_quick(
+            [hverify, "snapshot", str(target_dir), "--out", manifest_out, "--json"],
+            env=env,
+            timeout=15.0,
+        )
+        parsed = _try_json(out)
+        if parsed is None and os.path.isfile(manifest_out):
+            try:
+                parsed = json.loads(Path(manifest_out).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                parsed = None
+
+    if not isinstance(parsed, dict):
+        return {"available": True, "test_files": 0, "test_functions": 0, "assertions": 0, "skips": 0}
+
+    summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else parsed
+    files_obj = parsed.get("files")
+    files_len = len(files_obj) if isinstance(files_obj, (list, dict)) else 0
+
+    test_files = _pick_int(summary, ("test_files", "file_count", "files_count", "total_files"), files_len)
+    test_fns = _pick_int(summary, ("test_functions", "tests", "test_count", "functions", "total_tests"))
+    assertions = _pick_int(summary, ("assertions", "assertion_count", "total_assertions"))
+    skips = _pick_int(summary, ("skip_markers", "skips", "skip_count", "total_skips"))
+
+    # Sum across file entries if summary did not aggregate them
+    if isinstance(files_obj, dict) and assertions == 0 and files_len > 0:
+        for entry in files_obj.values():
+            if isinstance(entry, dict):
+                test_fns += _pick_int(entry, ("test_functions", "tests", "test_count", "functions"))
+                assertions += _pick_int(entry, ("assertions", "assertion_count"))
+                skips += _pick_int(entry, ("skip_markers", "skips", "skip_count"))
+    elif isinstance(files_obj, list) and assertions == 0 and files_len > 0:
+        for entry in files_obj:
+            if isinstance(entry, dict):
+                test_fns += _pick_int(entry, ("test_functions", "tests", "test_count", "functions"))
+                assertions += _pick_int(entry, ("assertions", "assertion_count"))
+                skips += _pick_int(entry, ("skip_markers", "skips", "skip_count"))
+
+    return {
+        "available": True,
+        "test_files": test_files,
+        "test_functions": test_fns,
+        "assertions": assertions,
+        "skips": skips,
+        "elapsed_ms": round(dt, 2),
+    }
+
+
+def _audit_memory(env: dict[str, str], sq_info: dict[str, Any]) -> dict[str, Any]:
+    hmemory = resolve_binary("hmemory")
+    if not hmemory:
+        return {"available": False, "posture": sq_info["label"]}
+
+    db_path = resolve_memory_db_path(env)
+    if not db_path.is_file():
+        return {
+            "available": True,
+            "initialized": False,
+            "active_beliefs": 0,
+            "retracted_beliefs": 0,
+            "edges": 0,
+            "posture": "jtms + fts5 ready",
+        }
+
+    rc, out, _, dt = _run_quick([hmemory, "stats", "--json"], env=env, timeout=5.0)
+    parsed = _try_json(out) if rc == 0 else None
+    active_b = 0
+    retracted_b = 0
+    edges_n = 0
+    if parsed:
+        active_b = _pick_int(parsed, ("active_beliefs", "in_beliefs", "active", "beliefs_in", "total_active"))
+        retracted_b = _pick_int(
+            parsed,
+            ("retracted_beliefs", "out_beliefs", "retracted", "superseded", "beliefs_out"),
+        )
+        if active_b == 0 and "total_beliefs" in parsed:
+            active_b = max(0, _pick_int(parsed, ("total_beliefs",)) - retracted_b)
+        edges_n = _pick_int(parsed, ("edges", "jtms_edges", "links", "total_edges"))
+
+    return {
+        "available": True,
+        "initialized": True,
+        "active_beliefs": active_b,
+        "retracted_beliefs": retracted_b,
+        "edges": edges_n,
+        "posture": "jtms + fts5 active",
+        "elapsed_ms": round(dt, 2),
+    }
+
+
+def _audit_voice() -> dict[str, Any]:
+    hvoice = resolve_binary("hvoice")
+    if not hvoice:
+        return {"available": False}
+
+    state_file = get_hephaestus_home() / "voice" / "state.json"
+    profile = "peer-engineer"
+    notes_n = 0
+    if state_file.is_file():
+        try:
+            st = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(st, dict):
+                profile = str(st.get("profile") or st.get("active_profile") or profile)
+                notes = st.get("notes") or st.get("continuity_notes") or []
+                if isinstance(notes, list):
+                    notes_n = len(notes)
+        except (OSError, ValueError):
+            pass
+
+    return {
+        "available": True,
+        "profile": profile,
+        "notes": notes_n,
+        "posture": "<160 tok pushback frame",
+    }
+
+
+def cmd_audit(args: list[str]) -> int:
+    as_json = False
+    target_arg = "."
+    for arg in args:
+        if arg == "--json":
+            as_json = True
+        elif arg in ("-h", "--help"):
+            print("usage: hephaestus audit [dir] [--json]")
+            return 0
+        elif arg.startswith("-"):
+            print(f"hephaestus audit: unknown option '{arg}'", file=sys.stderr)
+            return 2
+        else:
+            target_arg = arg
+
+    target_dir = Path(target_arg).resolve()
+    if not target_dir.exists():
+        print(f"hephaestus audit: path does not exist: {target_arg}", file=sys.stderr)
+        return 2
+
+    t0 = time.perf_counter()
+    cfg = load_config()
+    enabled = set(cfg["enabled_organs"])
+    env = build_organ_env()
+    ll_info = probe_landlock()
+    sq_info = probe_sqlite()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fut_slice = pool.submit(_audit_slice, target_dir, env) if "slice" in enabled else None
+        fut_shield = pool.submit(_audit_shield, target_dir, env, ll_info) if "shield" in enabled else None
+        fut_verify = pool.submit(_audit_verify, target_dir, env) if "verify" in enabled else None
+        fut_memory = pool.submit(_audit_memory, env, sq_info) if "memory" in enabled else None
+
+        slice_res = fut_slice.result() if fut_slice else {"enabled": False}
+        shield_res = fut_shield.result() if fut_shield else {"enabled": False}
+        verify_res = fut_verify.result() if fut_verify else {"enabled": False}
+        memory_res = fut_memory.result() if fut_memory else {"enabled": False}
+    voice_res = _audit_voice() if "voice" in enabled else {"enabled": False}
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+    active_tools = sum(len(ORGAN_SPECS[o]["mcp_tools"]) for o in cfg["enabled_organs"])
+
+    payload = {
+        "version": VERSION,
+        "repository": target_dir.name,
+        "path": str(target_dir),
+        "enabled_organs": cfg["enabled_organs"],
+        "active_mcp_tools": active_tools,
+        "organs": {
+            "slice": slice_res,
+            "shield": shield_res,
+            "verify": verify_res,
+            "memory": memory_res,
+            "voice": voice_res,
+        },
+        "elapsed_ms": elapsed_ms,
+    }
+
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    hdr_meta = ""
+    if slice_res.get("available"):
+        hdr_meta = f" ({slice_res['files']} files, {slice_res['symbols']} symbols)"
+
+    lines: list[str] = []
+    lines.append(f"hephaestus audit  {target_dir.name}{hdr_meta}")
+    lines.append(RULE)
+    lines.append(f"{'organ':<8} {'signal':<24} {'measured':<35} {'posture'}")
+    lines.append(RULE)
+
+    # 1. slice row
+    if "slice" not in enabled:
+        lines.append(f"{'slice':<8} {'symbol slice economy':<24} {'disabled':<35} {'off'}")
+    elif not slice_res.get("available"):
+        lines.append(f"{'slice':<8} {'symbol slice economy':<24} {'binary missing':<35} {'unbuilt'}")
+    else:
+        ft = slice_res["file_tokens"]
+        st = slice_res["slice_tokens"]
+        sp = slice_res["saved_pct"]
+        dx = slice_res["density_x"]
+        meas = f"{ft:,} -> {st:,} tok (-{sp:.1f}%)" if ft > 0 else "0 indexed symbols"
+        pos = f"{dx:.1f}x density" if dx > 0 else "mmap trigram"
+        lines.append(f"{'slice':<8} {'symbol slice economy':<24} {meas:<35} {pos}")
+
+    # 2. shield row
+    if "shield" not in enabled:
+        lines.append(f"{'shield':<8} {'trap & sandbox surface':<24} {'disabled':<35} {'off'}")
+    elif not shield_res.get("available"):
+        lines.append(f"{'shield':<8} {'trap & sandbox surface':<24} {'binary missing':<35} {ll_info['label']}")
+    else:
+        fc = shield_res["findings"]
+        meas = "0 traps detected (clean)" if shield_res["clean"] else f"{fc} trap finding(s) flagged"
+        lines.append(f"{'shield':<8} {'trap & sandbox surface':<24} {meas:<35} {shield_res['posture']}")
+
+    # 3. verify row
+    if "verify" not in enabled:
+        lines.append(f"{'verify':<8} {'test integrity baseline':<24} {'disabled':<35} {'off'}")
+    elif not verify_res.get("available"):
+        lines.append(f"{'verify':<8} {'test integrity baseline':<24} {'binary missing':<35} {'unbuilt'}")
+    else:
+        tf = verify_res["test_files"]
+        asrt = verify_res["assertions"]
+        sk = verify_res["skips"]
+        meas = f"{tf} test files, {asrt:,} assertions"
+        pos = f"{sk} skips, sha256"
+        lines.append(f"{'verify':<8} {'test integrity baseline':<24} {meas:<35} {pos}")
+
+    # 4. memory row
+    if "memory" not in enabled:
+        lines.append(f"{'memory':<8} {'jtms belief store':<24} {'disabled':<35} {'off'}")
+    elif not memory_res.get("available"):
+        lines.append(f"{'memory':<8} {'jtms belief store':<24} {'binary missing':<35} {sq_info['label']}")
+    else:
+        ab = memory_res["active_beliefs"]
+        rb = memory_res["retracted_beliefs"]
+        meas = f"{ab} active, {rb} retracted beliefs"
+        lines.append(f"{'memory':<8} {'jtms belief store':<24} {meas:<35} {memory_res['posture']}")
+
+    # 5. voice row
+    if "voice" not in enabled:
+        lines.append(f"{'voice':<8} {'anti-sycophancy engine':<24} {'disabled':<35} {'off'}")
+    elif not voice_res.get("available"):
+        lines.append(f"{'voice':<8} {'anti-sycophancy engine':<24} {'binary missing':<35} {'unbuilt'}")
+    else:
+        prof = f"profile: {voice_res['profile']}"
+        lines.append(f"{'voice':<8} {'anti-sycophancy engine':<24} {prof:<35} {voice_res['posture']}")
+
+    top_syms = slice_res.get("top_symbols") or []
+    if top_syms:
+        lines.append(RULE)
+        lines.append(f"{'top sliced symbols':<21} {'location':<31} {'file tok':>9} {'slice tok':>9} {'saved':>6}")
+        lines.append(RULE)
+        for item in top_syms[:5]:
+            sym = item["symbol"][:20]
+            loc = _clip_loc(item["location"], 31)
+            ft = item["file_tokens"]
+            st = item["slice_tokens"]
+            sp = item["saved_pct"]
+            lines.append(f"{sym:<21} {loc:<31} {ft:>9,} {st:>9,} {sp:>5.1f}%")
+
+    lines.append(RULE)
+    lines.append(
+        f"spine: {len(cfg['enabled_organs'])}/{len(ALL_ORGANS)} organs  \u00b7  mcp tools: {active_tools}  \u00b7  elapsed: {elapsed_ms:.1f} ms"
+    )
+    lines.append("github.com/Hephaestus-Zero/hephaestus")
+    print("\n".join(lines))
+    return 0
+
+
+def _merge_json_file(dest: Path, patch: dict[str, Any]) -> None:
+    existing: dict[str, Any] = {}
+    if dest.is_file():
+        try:
+            loaded = json.loads(dest.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError):
+            existing = {}
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(existing.get(k), dict):
+            existing[k].update(v)
+        else:
+            existing[k] = v
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+
+
+def cmd_wire(args: list[str]) -> int:
+    target: str | None = None
+    only_raw: str | None = None
+    dry_run = False
+    as_json = False
+    dest_dir = Path.cwd()
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print("usage: hephaestus wire [--target claude|cursor|codex|mcp] [--only o1,o2] [--dest DIR] [--dry-run]")
+            return 0
+        if arg == "--dry-run":
+            dry_run = True
+        elif arg == "--json":
+            as_json = True
+        elif arg == "--target" and i + 1 < len(args):
+            i += 1
+            target = args[i].strip().lower()
+        elif arg.startswith("--target="):
+            target = arg.split("=", 1)[1].strip().lower()
+        elif arg == "--only" and i + 1 < len(args):
+            i += 1
+            only_raw = args[i]
+        elif arg.startswith("--only="):
+            only_raw = arg.split("=", 1)[1]
+        elif arg == "--dest" and i + 1 < len(args):
+            i += 1
+            dest_dir = Path(args[i]).resolve()
+        elif arg.startswith("--dest="):
+            dest_dir = Path(arg.split("=", 1)[1]).resolve()
+        else:
+            print(f"hephaestus wire: unknown argument '{arg}'", file=sys.stderr)
+            return 2
+        i += 1
+
+    if target is None:
+        target = "mcp"
+        dry_run = True
+
+    if target not in ("claude", "cursor", "codex", "mcp"):
+        print(f"hephaestus wire: invalid --target '{target}' (expected claude, cursor, codex, or mcp)", file=sys.stderr)
+        return 2
+
+    if only_raw is not None:
+        try:
+            selected, _, _ = _parse_organ_args([only_raw])
+        except ValueError as exc:
+            print(f"hephaestus wire: {exc}", file=sys.stderr)
+            return 2
+    else:
+        selected = load_config()["enabled_organs"]
+
+    mcp_script = resolve_mcp_server() or "hephaestus_mcp.py"
+    mcp_args = [mcp_script]
+    if only_raw is not None:
+        mcp_args.extend(["--organs", ",".join(selected)])
+
+    mcp_entry = {
+        "command": "python3",
+        "args": mcp_args,
+    }
+
+    mcp_snippet: dict[str, Any] = {
+        "mcpServers": {
+            "hephaestus": mcp_entry,
+        }
+    }
+
+    hhook_bin = resolve_binary("hhook") or "hhook"
+    claude_hooks: dict[str, Any] = {}
+    if "shield" in selected:
+        claude_hooks = {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": hhook_bin}],
+                    }
+                ]
+            }
+        }
+
+    skills_root = resolve_skills_root()
+    skill_paths = [
+        str(skills_root / o / "SKILL.md") if skills_root else f"skills/{o}/SKILL.md"
+        for o in selected
+    ]
+
+    codex_args_toml = ", ".join(json.dumps(a) for a in mcp_args)
+    codex_toml = (
+        f"[mcp_servers.hephaestus]\n"
+        f'command = "python3"\n'
+        f"args = [{codex_args_toml}]\n"
+    )
+
+    if dry_run or target == "mcp":
+        payload: dict[str, Any] = {
+            "target": target,
+            "organs": selected,
+            "mcp": mcp_snippet,
+            "skills": skill_paths,
+        }
+        if claude_hooks:
+            payload["claude_hooks"] = claude_hooks
+        if target == "codex":
+            if as_json:
+                payload["codex_toml"] = codex_toml
+                print(json.dumps(payload, indent=2))
+            else:
+                print(codex_toml.rstrip())
+            return 0
+        print(json.dumps(payload if as_json else mcp_snippet, indent=2))
+        return 0
+
+    written: list[str] = []
+    if target == "claude":
+        mcp_file = dest_dir / ".mcp.json"
+        _merge_json_file(mcp_file, mcp_snippet)
+        written.append(str(mcp_file))
+        if claude_hooks:
+            settings_file = dest_dir / ".claude" / "settings.local.json"
+            _merge_json_file(settings_file, claude_hooks)
+            written.append(str(settings_file))
+    elif target == "cursor":
+        cursor_mcp = dest_dir / ".cursor" / "mcp.json"
+        _merge_json_file(cursor_mcp, mcp_snippet)
+        written.append(str(cursor_mcp))
+    elif target == "codex":
+        codex_file = dest_dir / ".codex" / "config.toml"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        existing_txt = codex_file.read_text(encoding="utf-8") if codex_file.is_file() else ""
+        if "[mcp_servers.hephaestus]" not in existing_txt:
+            sep = "\n" if existing_txt and not existing_txt.endswith("\n") else ""
+            codex_file.write_text(f"{existing_txt}{sep}{codex_toml}", encoding="utf-8")
+        written.append(str(codex_file))
+
+    if as_json:
+        print(json.dumps({"target": target, "organs": selected, "written": written}, indent=2))
+    else:
+        print(f"wired {target} ({', '.join(selected)}) -> {', '.join(written)}")
+    return 0
+
+
+def cmd_passthrough(subcmd: str, rest: list[str]) -> int:
+    if subcmd == "mcp":
+        mcp_path = resolve_mcp_server()
+        if not mcp_path:
+            print("hephaestus: mcp/hephaestus_mcp.py not found", file=sys.stderr)
+            return 127
+        env = build_organ_env()
+        os.execve(sys.executable, [sys.executable, mcp_path, *rest], env)
+
+    organ_name, bin_name = PASSTHROUGH_MAP[subcmd]
+    bin_path = resolve_binary(bin_name)
+    if not bin_path:
+        print(
+            f"hephaestus: binary '{bin_name}' (organ '{organ_name}') is not installed. "
+            f"Build with 'make' or run './install.sh --only {organ_name}'.",
+            file=sys.stderr,
+        )
+        return 127
+
+    env = build_organ_env()
+    # Preserve symlink path (e.g. .../hsearch -> hfind) in argv[0] so multi-call C binaries dispatch properly
+    os.execve(bin_path, [bin_path, *rest], env)
+
+
+def print_help() -> None:
+    text = f"""hephaestus {VERSION}  modular C11 & SQLite spine for AI coding agents
+{RULE}
+spine commands
+  hephaestus audit [dir] [--json]        run 5-organ repository & posture receipt
+  hephaestus doctor [--json]             verify binaries, SQLite FTS5, Landlock & latency
+  hephaestus status [--json]             show active spine health and organ states
+  hephaestus organs [--json]             list all 5 organs and MCP tool counts
+  hephaestus enable <organ...> [--only]  enable organs (slice, shield, verify, memory, voice)
+  hephaestus disable <organ...>          disable organs immediately
+  hephaestus wire [--target T] [--only]  emit or merge minimal MCP / hook config
+
+organ pass-throughs
+  hephaestus slice ...                   hslice structural AST symbol slicer
+  hephaestus find ...                    hfind mmap trigram path search
+  hephaestus search ...                  hsearch mmap symbol & regex search
+  hephaestus shield ...                  hshield Landlock sandbox & repo trap auditor
+  hephaestus hook ...                    hhook C11 shell command safety gate
+  hephaestus verify ...                  hverify anti-tamper test verifier
+  hephaestus memory ...                  hmemory SQLite WAL/FTS5 + JTMS belief engine
+  hephaestus voice ...                   hvoice anti-sycophancy posture & slop linter
+  hephaestus mcp [--organs o1,o2]        launch stdio JSON-RPC 2.0 MCP server
+{RULE}"""
+    print(text)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in ("-h", "--help", "help"):
+        print_help()
+        return 0
+    if args[0] in ("-V", "--version", "version"):
+        print(f"hephaestus {VERSION}")
+        return 0
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub in ("doctor", "status"):
+        as_json = "--json" in rest
+        rep = collect_doctor_report(run_latency_probes=True)
+        if as_json:
+            print(json.dumps(rep, indent=2))
+        else:
+            print(render_doctor_table(rep, mode=sub))
+        return 0 if (sub == "status" or rep["healthy"]) else 1
+
+    if sub == "organs":
+        return cmd_organs(rest)
+    if sub == "enable":
+        return cmd_toggle(rest, enable=True)
+    if sub == "disable":
+        return cmd_toggle(rest, enable=False)
+    if sub == "audit":
+        return cmd_audit(rest)
+    if sub == "wire":
+        return cmd_wire(rest)
+    if sub == "mcp" or sub in PASSTHROUGH_MAP:
+        return cmd_passthrough(sub, rest)
+
+    print(f"hephaestus: unknown command '{sub}'. Run 'hephaestus --help' for usage.", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

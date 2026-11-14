@@ -1,0 +1,1150 @@
+#!/usr/bin/env python3
+"""hverify: O_NOFOLLOW SHA-256 and structural anti-reward-hacking test verifier."""
+
+from __future__ import annotations
+
+import ast
+import datetime as dt
+import errno
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+VERSION = "0.1.0"
+DEFAULT_MANIFEST_NAME = ".hephaestus-verify.json"
+
+IGNORED_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "build",
+        "dist",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".nox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "target",
+        ".next",
+        ".cache",
+        ".eggs",
+    }
+)
+
+PROTECTED_BASENAMES: frozenset[str] = frozenset(
+    {
+        "conftest.py",
+        "sitecustomize.py",
+        "usercustomize.py",
+        "pytest.ini",
+        ".coveragerc",
+        "tox.ini",
+    }
+)
+
+TEST_DIR_NAMES: frozenset[str] = frozenset({"tests", "test", "__tests__"})
+
+CODE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".py",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hpp",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".rs",
+        ".go",
+        ".java",
+        ".kt",
+        ".rb",
+        ".php",
+        ".swift",
+        ".sh",
+    }
+)
+
+BINARY_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".pyc",
+        ".pyo",
+        ".pyd",
+        ".o",
+        ".a",
+        ".so",
+        ".dylib",
+        ".dll",
+        ".exe",
+        ".idx",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".pdf",
+        ".tar",
+        ".gz",
+        ".tgz",
+        ".xz",
+        ".zst",
+        ".zip",
+        ".whl",
+    }
+)
+
+# Polyglot regexes applied to comment-stripped source text.
+RE_TEST_FN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bdef\s+test_[A-Za-z0-9_]*\s*\("),
+    re.compile(r"\b(?:it|test)\s*\("),
+    re.compile(r"#\[\s*(?:[A-Za-z0-9_]+::)*test\b"),
+    re.compile(r"\bfunc\s+Test[A-Za-z0-9_]*\s*\("),
+    re.compile(r"\bTEST(?:_F|_P|_CASE)?\s*\("),
+    re.compile(r"\bvoid\s+test_[A-Za-z0-9_]*\s*\("),
+    re.compile(r"\bint\s+test_[A-Za-z0-9_]*\s*\("),
+)
+
+RE_TAUTOLOGY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bassert\s*\(\s*(?:true|1)\s*\)"),
+    re.compile(r"\bassert!\s*\(\s*true\s*\)"),
+    re.compile(r"\bassert\s+True\b"),
+    re.compile(r"\bexpect\s*\(\s*true\s*\)\s*\.\s*toBe(?:Truthy)?\s*\(\s*(?:true)?\s*\)"),
+)
+
+RE_ASSERT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bself\.assert[A-Za-z0-9_]*\s*\("),
+    re.compile(r"\bassert(?:_(?:eq|ne|matches|approx_eq))?!?\s*\("),
+    re.compile(r"(?<!\.)\bassert\s+(?!\()"),
+    re.compile(r"\bexpect\s*\("),
+    re.compile(r"\b(?:ASSERT|EXPECT|CHECK)_[A-Z0-9_]+\s*\("),
+    re.compile(r"\brequire\.[A-Za-z0-9_]+\s*\("),
+)
+
+RE_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"@(?:\w+\.)*skip(?:If|Unless|if)?\b"),
+    re.compile(r"\bunittest\.skip(?:If|Unless)?\b"),
+    re.compile(r"\bpytest\.mark\.(?:skip|skipif|xfail)\b"),
+    re.compile(r"\bpytest\.(?:skip|xfail)\s*\("),
+    re.compile(r"\bself\.skipTest\s*\("),
+    re.compile(r"(?:\b(?:it|test|describe|context)|(?<!\w))\.skip\s*\("),
+    re.compile(r"#\[\s*ignore\b"),
+    re.compile(r"\bt\.Skip(?:Now|f)?\s*\("),
+)
+
+
+class SymlinkRefusedError(OSError):
+    """Raised when O_NOFOLLOW or lstat detects a symbolic link or non-regular file."""
+
+
+def get_hephaestus_home() -> Path:
+    env_home = os.environ.get("HEPHAESTUS_HOME", "").strip()
+    if env_home:
+        return Path(env_home).expanduser()
+    return Path.home() / ".hephaestus"
+
+
+def workspace_store_path(target_dir: Path) -> Path:
+    digest = hashlib.sha256(str(target_dir.resolve()).encode("utf-8")).hexdigest()[:24]
+    return get_hephaestus_home() / "verify" / f"{digest}.json"
+
+
+def read_regular_nofollow(path: Path) -> bytes:
+    """Read a regular file via O_NOFOLLOW descriptor + fstat verification."""
+    try:
+        lst = os.lstat(path)
+    except OSError as exc:
+        raise exc
+
+    if stat.S_ISLNK(lst.st_mode):
+        raise SymlinkRefusedError(errno.ELOOP, "Refusing symbolic link", str(path))
+    if not stat.S_ISREG(lst.st_mode):
+        raise SymlinkRefusedError(errno.EINVAL, "Refusing non-regular file", str(path))
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", errno.ELOOP)):
+            raise SymlinkRefusedError(errno.ELOOP, "Refusing symbolic link on open", str(path)) from exc
+        raise
+
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            raise SymlinkRefusedError(errno.EINVAL, "Descriptor is not a regular file", str(path))
+        if fst.st_ino != lst.st_ino or fst.st_dev != lst.st_dev:
+            raise SymlinkRefusedError(errno.ELOOP, "File inode changed during open", str(path))
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def is_protected_file(rel_posix: str, basename: str) -> bool:
+    if basename in PROTECTED_BASENAMES:
+        return True
+    if basename.endswith(".pth"):
+        return True
+    return False
+
+
+def is_test_file(rel_posix: str, basename: str) -> bool:
+    if basename == DEFAULT_MANIFEST_NAME or basename.startswith("."):
+        return False
+    if basename == "__init__.py" or basename in PROTECTED_BASENAMES or basename.endswith(".pth"):
+        return False
+
+    lower_name = basename.lower()
+    _, ext = os.path.splitext(lower_name)
+    if ext in BINARY_EXTENSIONS:
+        return False
+
+    name_matches = (
+        fnmatch.fnmatch(lower_name, "test_*")
+        or fnmatch.fnmatch(lower_name, "*_test.*")
+        or fnmatch.fnmatch(lower_name, "*.spec.*")
+        or fnmatch.fnmatch(lower_name, "*.test.*")
+    )
+    if name_matches:
+        return ext in CODE_EXTENSIONS or ext == ""
+
+    parts = rel_posix.split("/")[:-1]
+    if any(p.lower() in TEST_DIR_NAMES for p in parts):
+        return ext in CODE_EXTENSIONS
+
+    return False
+
+
+def strip_comments_c_family(source: str, hash_comments: bool = False) -> str:
+    """Strip line and block comments while preserving string literals and newlines."""
+    out: list[str] = []
+    n = len(source)
+    i = 0
+    in_str: str | None = None
+
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+
+        if in_str is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(source[i + 1])
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            while i < n and source[i] != "\n":
+                i += 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i < n:
+                if source[i] == "*" and i + 1 < n and source[i + 1] == "/":
+                    i += 2
+                    break
+                if source[i] == "\n":
+                    out.append("\n")
+                i += 1
+            continue
+
+        if hash_comments and ch == "#" and nxt != "[":
+            while i < n and source[i] != "\n":
+                i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _dotted_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    if isinstance(node, ast.Call):
+        return _dotted_name(node.func)
+    return ""
+
+
+def _is_truthy_constant(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        if node.value is None or node.value is Ellipsis:
+            return False
+        return bool(node.value) is True
+    return False
+
+
+def analyze_python_source(source: str) -> dict[str, Any] | None:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    test_functions = 0
+    assertions = 0
+    skip_markers = 0
+    tautologies = 0
+
+    skip_decorator_tails = (
+        "skip",
+        "skipif",
+        "skipunless",
+        "xfail",
+        "expectedfailure",
+    )
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "test" or node.name.startswith("test_"):
+                test_functions += 1
+            for dec in node.decorator_list:
+                dname = _dotted_name(dec).lower()
+                tail = dname.rsplit(".", 1)[-1]
+                if tail in skip_decorator_tails:
+                    skip_markers += 1
+
+        elif isinstance(node, ast.ClassDef):
+            for dec in node.decorator_list:
+                dname = _dotted_name(dec).lower()
+                tail = dname.rsplit(".", 1)[-1]
+                if tail in skip_decorator_tails:
+                    skip_markers += 1
+
+        elif isinstance(node, ast.Assert):
+            if _is_truthy_constant(node.test):
+                tautologies += 1
+            else:
+                assertions += 1
+
+        elif isinstance(node, ast.Call):
+            cname = _dotted_name(node.func)
+            tail = cname.rsplit(".", 1)[-1]
+            lower_cname = cname.lower()
+
+            if cname in ("self.skipTest", "pytest.skip", "pytest.xfail", "unittest.skip"):
+                skip_markers += 1
+                continue
+
+            if cname.startswith("self.assert") or cname == "self.fail":
+                if cname == "self.assertTrue" and node.args and _is_truthy_constant(node.args[0]):
+                    tautologies += 1
+                elif (
+                    cname == "self.assertEqual"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[0].value == node.args[1].value
+                ):
+                    tautologies += 1
+                else:
+                    assertions += 1
+            elif lower_cname in ("pytest.raises", "pytest.warns", "raises") or tail == "expect":
+                assertions += 1
+            elif cname.startswith("require."):
+                assertions += 1
+
+    return {
+        "test_functions": test_functions,
+        "assertions": assertions,
+        "skip_markers": skip_markers,
+        "tautologies": tautologies,
+        "syntax_error": False,
+    }
+
+
+def analyze_polyglot_source(source: str, ext: str) -> dict[str, Any]:
+    hash_comments = ext in (".py", ".sh", ".rb")
+    cleaned = strip_comments_c_family(source, hash_comments=hash_comments)
+
+    test_functions = sum(len(rx.findall(cleaned)) for rx in RE_TEST_FN_PATTERNS)
+    skip_markers = sum(len(rx.findall(cleaned)) for rx in RE_SKIP_PATTERNS)
+
+    tautologies = 0
+    scrubbed = cleaned
+    for trx in RE_TAUTOLOGY_PATTERNS:
+        matches = trx.findall(scrubbed)
+        if matches:
+            tautologies += len(matches)
+            scrubbed = trx.sub(" ", scrubbed)
+
+    # Avoid double counting self.assert*(...) with bare assert patterns.
+    self_asserts = len(RE_ASSERT_PATTERNS[0].findall(scrubbed))
+    scrubbed_no_self = RE_ASSERT_PATTERNS[0].sub(" ", scrubbed)
+    other_asserts = sum(len(rx.findall(scrubbed_no_self)) for rx in RE_ASSERT_PATTERNS[1:])
+
+    return {
+        "test_functions": test_functions,
+        "assertions": self_asserts + other_asserts,
+        "skip_markers": skip_markers,
+        "tautologies": tautologies,
+        "syntax_error": False,
+    }
+
+
+def analyze_file_bytes(raw: bytes, ext: str) -> dict[str, Any]:
+    digest = hashlib.sha256(raw).hexdigest()
+    if b"\x00" in raw[:4096]:
+        return {
+            "sha256": digest,
+            "size": len(raw),
+            "test_functions": 0,
+            "assertions": 0,
+            "skip_markers": 0,
+            "tautologies": 0,
+            "syntax_error": False,
+        }
+
+    text = raw.decode("utf-8", errors="replace")
+    if ext == ".py":
+        py_metrics = analyze_python_source(text)
+        if py_metrics is None:
+            metrics = analyze_polyglot_source(text, ext)
+            metrics["syntax_error"] = True
+        else:
+            metrics = py_metrics
+    else:
+        metrics = analyze_polyglot_source(text, ext)
+
+    return {
+        "sha256": digest,
+        "size": len(raw),
+        **metrics,
+    }
+
+
+def scan_workspace(target_dir: Path) -> dict[str, Any]:
+    root = target_dir.resolve()
+    if os.path.islink(target_dir):
+        raise SymlinkRefusedError(errno.ELOOP, "Refusing symlinked target directory", str(target_dir))
+    if not root.is_dir():
+        raise FileNotFoundError(f"Directory does not exist: {target_dir}")
+
+    files_map: dict[str, dict[str, Any]] = {}
+    protected_map: dict[str, dict[str, Any]] = {}
+    refused_symlinks: list[str] = []
+
+    for cur_root, dirs, filenames in os.walk(root, topdown=True, followlinks=False):
+        kept_dirs: list[str] = []
+        for d in sorted(dirs):
+            if d in IGNORED_DIRS or d.endswith(".egg-info"):
+                continue
+            full_d = os.path.join(cur_root, d)
+            if os.path.islink(full_d):
+                continue
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
+
+        for fname in sorted(filenames):
+            full_path = Path(cur_root) / fname
+            rel_posix = full_path.relative_to(root).as_posix()
+
+            want_protected = is_protected_file(rel_posix, fname)
+            want_test = is_test_file(rel_posix, fname)
+            if not want_protected and not want_test:
+                continue
+
+            try:
+                raw = read_regular_nofollow(full_path)
+            except SymlinkRefusedError:
+                refused_symlinks.append(rel_posix)
+                continue
+            except OSError:
+                continue
+
+            _, ext = os.path.splitext(fname.lower())
+            info = analyze_file_bytes(raw, ext)
+
+            if want_protected:
+                protected_map[rel_posix] = {
+                    "sha256": info["sha256"],
+                    "size": info["size"],
+                }
+            if want_test:
+                files_map[rel_posix] = info
+
+    total_test_files = len(files_map)
+    total_test_fns = sum(v["test_functions"] for v in files_map.values())
+    total_assertions = sum(v["assertions"] for v in files_map.values())
+    total_skips = sum(v["skip_markers"] for v in files_map.values())
+    total_tautologies = sum(v["tautologies"] for v in files_map.values())
+
+    return {
+        "schema_version": 1,
+        "tool": "hverify",
+        "version": VERSION,
+        "created_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "repository": root.name,
+        "summary": {
+            "test_files": total_test_files,
+            "test_functions": total_test_fns,
+            "assertions": total_assertions,
+            "skip_markers": total_skips,
+            "tautologies": total_tautologies,
+            "protected_files": len(protected_map),
+        },
+        "files": files_map,
+        "protected_files": protected_map,
+        "refused_symlinks": refused_symlinks,
+    }
+
+
+def atomic_write_json(dest: Path, payload: dict[str, Any]) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.tmp.", dir=str(dest.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_name, dest)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def compare_manifests(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    base_files: dict[str, Any] = baseline.get("files") if isinstance(baseline.get("files"), dict) else {}
+    cur_files: dict[str, Any] = current.get("files") if isinstance(current.get("files"), dict) else {}
+    base_prot: dict[str, Any] = (
+        baseline.get("protected_files") if isinstance(baseline.get("protected_files"), dict) else {}
+    )
+    cur_prot: dict[str, Any] = (
+        current.get("protected_files") if isinstance(current.get("protected_files"), dict) else {}
+    )
+    refused = set(current.get("refused_symlinks") or [])
+
+    violations: list[dict[str, Any]] = []
+    modified_files: list[str] = []
+
+    for rel_path, binfo in sorted(base_files.items()):
+        if rel_path in refused:
+            violations.append(
+                {
+                    "kind": "symlink_swap",
+                    "file": rel_path,
+                    "detail": f"Test file '{rel_path}' was replaced with a symbolic link or special file.",
+                }
+            )
+            continue
+
+        if rel_path not in cur_files:
+            violations.append(
+                {
+                    "kind": "deleted_test_file",
+                    "file": rel_path,
+                    "detail": f"Test file '{rel_path}' was deleted.",
+                }
+            )
+            continue
+
+        cinfo = cur_files[rel_path]
+        if cinfo.get("sha256") != binfo.get("sha256"):
+            modified_files.append(rel_path)
+
+        b_fns = int(binfo.get("test_functions", 0))
+        c_fns = int(cinfo.get("test_functions", 0))
+        if c_fns < b_fns:
+            violations.append(
+                {
+                    "kind": "decreased_test_functions",
+                    "file": rel_path,
+                    "baseline": b_fns,
+                    "current": c_fns,
+                    "detail": f"Test function count in '{rel_path}' dropped from {b_fns} to {c_fns}.",
+                }
+            )
+
+        b_asserts = int(binfo.get("assertions", 0))
+        c_asserts = int(cinfo.get("assertions", 0))
+        if c_asserts < b_asserts:
+            violations.append(
+                {
+                    "kind": "decreased_assertions",
+                    "file": rel_path,
+                    "baseline": b_asserts,
+                    "current": c_asserts,
+                    "detail": f"Assertion count in '{rel_path}' dropped from {b_asserts} to {c_asserts}.",
+                }
+            )
+
+        b_skips = int(binfo.get("skip_markers", 0))
+        c_skips = int(cinfo.get("skip_markers", 0))
+        if c_skips > b_skips:
+            violations.append(
+                {
+                    "kind": "increased_skip_markers",
+                    "file": rel_path,
+                    "baseline": b_skips,
+                    "current": c_skips,
+                    "detail": f"Skip markers in '{rel_path}' increased from {b_skips} to {c_skips}.",
+                }
+            )
+
+        b_taut = int(binfo.get("tautologies", 0))
+        c_taut = int(cinfo.get("tautologies", 0))
+        if c_taut > b_taut:
+            violations.append(
+                {
+                    "kind": "injected_tautology",
+                    "file": rel_path,
+                    "baseline": b_taut,
+                    "current": c_taut,
+                    "detail": f"Tautological assertions in '{rel_path}' increased from {b_taut} to {c_taut}.",
+                }
+            )
+
+        if bool(cinfo.get("syntax_error")) and not bool(binfo.get("syntax_error")):
+            violations.append(
+                {
+                    "kind": "syntax_error",
+                    "file": rel_path,
+                    "detail": f"Test file '{rel_path}' introduced a syntax error.",
+                }
+            )
+
+    # Check newly created test files for injected skip markers or tautologies.
+    for rel_path, cinfo in sorted(cur_files.items()):
+        if rel_path in base_files:
+            continue
+        c_skips = int(cinfo.get("skip_markers", 0))
+        if c_skips > 0:
+            violations.append(
+                {
+                    "kind": "increased_skip_markers",
+                    "file": rel_path,
+                    "baseline": 0,
+                    "current": c_skips,
+                    "detail": f"New test file '{rel_path}' added {c_skips} skip marker(s).",
+                }
+            )
+        c_taut = int(cinfo.get("tautologies", 0))
+        if c_taut > 0:
+            violations.append(
+                {
+                    "kind": "injected_tautology",
+                    "file": rel_path,
+                    "baseline": 0,
+                    "current": c_taut,
+                    "detail": f"New test file '{rel_path}' contains {c_taut} tautological assertion(s).",
+                }
+            )
+
+    # Check protected runner/config files for tampering or injection.
+    for rel_path, bprot in sorted(base_prot.items()):
+        if rel_path in refused or rel_path not in cur_prot:
+            violations.append(
+                {
+                    "kind": "tampered_protected_file",
+                    "file": rel_path,
+                    "detail": f"Protected test harness file '{rel_path}' was deleted or replaced.",
+                }
+            )
+        elif cur_prot[rel_path].get("sha256") != bprot.get("sha256"):
+            violations.append(
+                {
+                    "kind": "tampered_protected_file",
+                    "file": rel_path,
+                    "detail": f"Protected test harness file '{rel_path}' was modified.",
+                }
+            )
+
+    for rel_path in sorted(cur_prot.keys()):
+        if rel_path not in base_prot:
+            violations.append(
+                {
+                    "kind": "injected_protected_file",
+                    "file": rel_path,
+                    "detail": f"Protected test harness file '{rel_path}' was newly injected.",
+                }
+            )
+
+    base_sum = baseline.get("summary") if isinstance(baseline.get("summary"), dict) else {}
+    cur_sum = current.get("summary") if isinstance(current.get("summary"), dict) else {}
+
+    deltas = {
+        "test_files": int(cur_sum.get("test_files", 0)) - int(base_sum.get("test_files", 0)),
+        "test_functions": int(cur_sum.get("test_functions", 0)) - int(base_sum.get("test_functions", 0)),
+        "assertions": int(cur_sum.get("assertions", 0)) - int(base_sum.get("assertions", 0)),
+        "skip_markers": int(cur_sum.get("skip_markers", 0)) - int(base_sum.get("skip_markers", 0)),
+        "tautologies": int(cur_sum.get("tautologies", 0)) - int(base_sum.get("tautologies", 0)),
+    }
+
+    # Aggregate fallback checks in case baseline lacked per-file granularity.
+    if not violations:
+        if deltas["test_files"] < 0:
+            violations.append(
+                {
+                    "kind": "deleted_test_file",
+                    "file": "*",
+                    "detail": "Aggregate test file count decreased.",
+                }
+            )
+        if deltas["test_functions"] < 0:
+            violations.append(
+                {
+                    "kind": "decreased_test_functions",
+                    "file": "*",
+                    "detail": "Aggregate test function count decreased.",
+                }
+            )
+        if deltas["assertions"] < 0:
+            violations.append(
+                {
+                    "kind": "decreased_assertions",
+                    "file": "*",
+                    "detail": "Aggregate assertion count decreased.",
+                }
+            )
+        if deltas["skip_markers"] > 0:
+            violations.append(
+                {
+                    "kind": "increased_skip_markers",
+                    "file": "*",
+                    "detail": "Aggregate skip marker count increased.",
+                }
+            )
+
+    intact = len(violations) == 0
+    return {
+        "intact": intact,
+        "clean": intact,
+        "status": "pass" if intact else "tampered",
+        "violations": violations,
+        "baseline_summary": base_sum,
+        "current_summary": cur_sum,
+        "deltas": deltas,
+        "modified_test_files": modified_files,
+    }
+
+
+def cmd_snapshot(args: list[str]) -> int:
+    target_arg = "."
+    out_arg: str | None = None
+    as_json = False
+    no_save = False
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print("usage: hverify snapshot [dir] [--out <manifest.json>] [--no-save] [--json]")
+            return 0
+        if arg == "--json":
+            as_json = True
+        elif arg == "--no-save":
+            no_save = True
+        elif arg == "--out" and i + 1 < len(args):
+            i += 1
+            out_arg = args[i]
+        elif arg.startswith("--out="):
+            out_arg = arg.split("=", 1)[1]
+        elif arg.startswith("-"):
+            print(f"hverify snapshot: unknown option '{arg}'", file=sys.stderr)
+            return 2
+        else:
+            target_arg = arg
+        i += 1
+
+    target_dir = Path(target_arg)
+    try:
+        manifest = scan_workspace(target_dir)
+    except (FileNotFoundError, SymlinkRefusedError, OSError) as exc:
+        if as_json:
+            print(json.dumps({"error": str(exc)}, indent=2))
+        else:
+            print(f"hverify snapshot: {exc}", file=sys.stderr)
+        return 2
+
+    saved_display = None
+    if not no_save:
+        if out_arg is not None:
+            dest = Path(out_arg)
+            atomic_write_json(dest, manifest)
+            saved_display = out_arg
+        else:
+            local_dest = target_dir.resolve() / DEFAULT_MANIFEST_NAME
+            try:
+                atomic_write_json(local_dest, manifest)
+                saved_display = DEFAULT_MANIFEST_NAME
+            except OSError:
+                fallback_dest = workspace_store_path(target_dir)
+                atomic_write_json(fallback_dest, manifest)
+                saved_display = str(fallback_dest)
+
+            # Best-effort mirror in HEPHAESTUS_HOME/verify for fallback lookup.
+            try:
+                mirror = workspace_store_path(target_dir)
+                if mirror.resolve() != local_dest.resolve():
+                    atomic_write_json(mirror, manifest)
+            except OSError:
+                pass
+
+    if as_json:
+        print(json.dumps(manifest, indent=2))
+    else:
+        s = manifest["summary"]
+        suffix = f" -> {saved_display}" if saved_display else ""
+        print(
+            f"hverify snapshot: {s['test_files']} test files, "
+            f"{s['test_functions']} test functions, "
+            f"{s['assertions']} assertions, "
+            f"{s['skip_markers']} skip markers{suffix}"
+        )
+    return 0
+
+
+def resolve_baseline_path(target_dir: Path, baseline_arg: str | None) -> Path | None:
+    if baseline_arg is not None:
+        cand = Path(baseline_arg)
+        return cand if cand.is_file() else None
+
+    local_cand = target_dir.resolve() / DEFAULT_MANIFEST_NAME
+    if local_cand.is_file():
+        return local_cand
+
+    store_cand = workspace_store_path(target_dir)
+    if store_cand.is_file():
+        return store_cand
+
+    return None
+
+
+def cmd_check(args: list[str]) -> int:
+    target_arg = "."
+    baseline_arg: str | None = None
+    as_json = False
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print("usage: hverify check [dir] [--baseline <manifest.json>] [--json]")
+            return 0
+        if arg == "--json":
+            as_json = True
+        elif arg == "--baseline" and i + 1 < len(args):
+            i += 1
+            baseline_arg = args[i]
+        elif arg.startswith("--baseline="):
+            baseline_arg = arg.split("=", 1)[1]
+        elif arg.startswith("-"):
+            print(f"hverify check: unknown option '{arg}'", file=sys.stderr)
+            return 2
+        else:
+            target_arg = arg
+        i += 1
+
+    target_dir = Path(target_arg)
+    if not target_dir.is_dir():
+        msg = f"Directory does not exist: {target_arg}"
+        if as_json:
+            print(json.dumps({"intact": False, "clean": False, "error": msg}, indent=2))
+        else:
+            print(f"hverify check: {msg}", file=sys.stderr)
+        return 2
+
+    base_path = resolve_baseline_path(target_dir, baseline_arg)
+    if base_path is None:
+        msg = (
+            f"Baseline manifest not found: {baseline_arg}"
+            if baseline_arg
+            else "No baseline manifest found. Run 'hverify snapshot' first."
+        )
+        if as_json:
+            print(json.dumps({"intact": False, "clean": False, "error": msg}, indent=2))
+        else:
+            print(f"hverify check: {msg}", file=sys.stderr)
+        return 2
+
+    try:
+        raw_base = read_regular_nofollow(base_path)
+        baseline = json.loads(raw_base.decode("utf-8"))
+        if not isinstance(baseline, dict):
+            raise ValueError("Baseline JSON root must be an object.")
+    except (OSError, ValueError) as exc:
+        msg = f"Failed to load baseline manifest: {exc}"
+        if as_json:
+            print(json.dumps({"intact": False, "clean": False, "error": msg}, indent=2))
+        else:
+            print(f"hverify check: {msg}", file=sys.stderr)
+        return 2
+
+    try:
+        current = scan_workspace(target_dir)
+    except (FileNotFoundError, SymlinkRefusedError, OSError) as exc:
+        msg = str(exc)
+        if as_json:
+            print(json.dumps({"intact": False, "clean": False, "error": msg}, indent=2))
+        else:
+            print(f"hverify check: {msg}", file=sys.stderr)
+        return 2
+
+    report = compare_manifests(baseline, current)
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        cs = report["current_summary"]
+        if report["intact"]:
+            print(
+                f"hverify check: PASS ({cs.get('test_files', 0)} test files, "
+                f"{cs.get('test_functions', 0)} test functions, "
+                f"{cs.get('assertions', 0)} assertions, "
+                f"{cs.get('skip_markers', 0)} skip markers)"
+            )
+        else:
+            print(f"hverify check: TAMPERED ({len(report['violations'])} violation(s) detected)", file=sys.stderr)
+            for v in report["violations"]:
+                print(f"  - [{v['kind']}] {v['detail']}", file=sys.stderr)
+
+    return 0 if report["intact"] else 1
+
+
+def cmd_run(args: list[str]) -> int:
+    if "-h" in args or "--help" in args:
+        if "--" not in args or args.index("-h" if "-h" in args else "--help") < args.index("--"):
+            print("usage: hverify run [dir] [--baseline <manifest.json>] [--json] -- <test_cmd...>")
+            return 0
+
+    if "--" in args:
+        sep_idx = args.index("--")
+        pre_args = args[:sep_idx]
+        test_cmd = args[sep_idx + 1 :]
+    else:
+        pre_args = []
+        test_cmd = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--json":
+                pre_args.append(a)
+                i += 1
+            elif a == "--baseline" and i + 1 < len(args):
+                pre_args.extend([a, args[i + 1]])
+                i += 2
+            elif a.startswith("--baseline="):
+                pre_args.append(a)
+                i += 1
+            elif not test_cmd and not pre_args and Path(a).is_dir():
+                pre_args.append(a)
+                i += 1
+            else:
+                test_cmd = args[i:]
+                break
+
+    target_arg = "."
+    baseline_arg: str | None = None
+    as_json = False
+
+    i = 0
+    while i < len(pre_args):
+        arg = pre_args[i]
+        if arg == "--json":
+            as_json = True
+        elif arg == "--baseline" and i + 1 < len(pre_args):
+            i += 1
+            baseline_arg = pre_args[i]
+        elif arg.startswith("--baseline="):
+            baseline_arg = arg.split("=", 1)[1]
+        elif arg.startswith("-"):
+            print(f"hverify run: unknown option '{arg}'", file=sys.stderr)
+            return 2
+        else:
+            target_arg = arg
+        i += 1
+
+    if not test_cmd:
+        print("hverify run: missing test command after '--'", file=sys.stderr)
+        return 2
+
+    target_dir = Path(target_arg)
+    if not target_dir.is_dir():
+        msg = f"Directory does not exist: {target_arg}"
+        if as_json:
+            print(json.dumps({"passed": False, "intact": False, "error": msg}, indent=2))
+        else:
+            print(f"hverify run: {msg}", file=sys.stderr)
+        return 2
+
+    try:
+        if baseline_arg is not None:
+            raw_base = read_regular_nofollow(Path(baseline_arg))
+            baseline = json.loads(raw_base.decode("utf-8"))
+        else:
+            with tempfile.TemporaryDirectory(prefix="hverify-run-") as tmpdir:
+                snap_file = Path(tmpdir) / "baseline.json"
+                baseline = scan_workspace(target_dir)
+                atomic_write_json(snap_file, baseline)
+    except (OSError, ValueError) as exc:
+        msg = f"Failed to capture pre-run baseline: {exc}"
+        if as_json:
+            print(json.dumps({"passed": False, "intact": False, "error": msg}, indent=2))
+        else:
+            print(f"hverify run: {msg}", file=sys.stderr)
+        return 2
+
+    try:
+        if as_json:
+            proc = subprocess.run(
+                test_cmd,
+                cwd=str(target_dir.resolve()),
+                capture_output=True,
+                text=True,
+            )
+            cmd_rc = proc.returncode
+            cmd_out = proc.stdout
+            cmd_err = proc.stderr
+        else:
+            proc_live = subprocess.run(
+                test_cmd,
+                cwd=str(target_dir.resolve()),
+            )
+            cmd_rc = proc_live.returncode
+            cmd_out = ""
+            cmd_err = ""
+    except OSError as exc:
+        msg = f"Failed to execute test command '{test_cmd[0]}': {exc}"
+        if as_json:
+            print(json.dumps({"passed": False, "intact": False, "command_exit_code": 127, "error": msg}, indent=2))
+        else:
+            print(f"hverify run: {msg}", file=sys.stderr)
+        return 127
+
+    try:
+        post_scan = scan_workspace(target_dir)
+    except (OSError, SymlinkRefusedError) as exc:
+        msg = f"Post-run scan failed: {exc}"
+        if as_json:
+            print(json.dumps({"passed": False, "intact": False, "command_exit_code": cmd_rc, "error": msg}, indent=2))
+        else:
+            print(f"hverify run: {msg}", file=sys.stderr)
+        return 1
+
+    integrity = compare_manifests(baseline, post_scan)
+    intact = integrity["intact"]
+    passed = (cmd_rc == 0) and intact
+
+    if passed:
+        verdict = "verified"
+    elif not intact:
+        verdict = "tampered"
+    else:
+        verdict = "test_failed"
+
+    if as_json:
+        payload = {
+            "passed": passed,
+            "intact": intact,
+            "clean": intact,
+            "verdict": verdict,
+            "command": test_cmd,
+            "command_exit_code": cmd_rc,
+            "violations": integrity["violations"],
+            "baseline_summary": integrity["baseline_summary"],
+            "current_summary": integrity["current_summary"],
+            "deltas": integrity["deltas"],
+            "stdout": cmd_out,
+            "stderr": cmd_err,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        cs = integrity["current_summary"]
+        if passed:
+            print(
+                f"hverify run: VERIFIED (exit=0, {cs.get('test_files', 0)} test files, "
+                f"{cs.get('assertions', 0)} assertions intact)"
+            )
+        elif not intact:
+            print(
+                f"hverify run: TAMPERED (exit={cmd_rc}, {len(integrity['violations'])} integrity violation(s))",
+                file=sys.stderr,
+            )
+            for v in integrity["violations"]:
+                print(f"  - [{v['kind']}] {v['detail']}", file=sys.stderr)
+        else:
+            print(f"hverify run: FAILED (test command exited with code {cmd_rc})", file=sys.stderr)
+
+    if passed:
+        return 0
+    if not intact:
+        return 1
+    return cmd_rc if cmd_rc != 0 else 1
+
+
+def print_help() -> None:
+    text = f"""hverify {VERSION} - O_NOFOLLOW SHA-256 and assertion-count anti-tamper verifier
+
+usage:
+  hverify snapshot [dir] [--out <manifest.json>] [--no-save] [--json]
+  hverify check [dir] [--baseline <manifest.json>] [--json]
+  hverify run [dir] [--baseline <manifest.json>] [--json] -- <test_cmd...>
+  hverify --version | --help
+"""
+    print(text.rstrip())
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in ("-h", "--help", "help"):
+        print_help()
+        return 0
+    if args[0] in ("-V", "--version", "version"):
+        print(f"hverify {VERSION}")
+        return 0
+
+    sub = args[0]
+    rest = args[1:]
+    if sub == "snapshot":
+        return cmd_snapshot(rest)
+    if sub == "check":
+        return cmd_check(rest)
+    if sub == "run":
+        return cmd_run(rest)
+
+    print(f"hverify: unknown subcommand '{sub}' (expected snapshot, check, or run)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
