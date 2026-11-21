@@ -351,10 +351,12 @@ typedef struct {
 
 static inline void hm_tokbag_add(hm_tokbag_t *bag, const char *tok) {
     if (!tok || strlen(tok) < 2U || hm_is_stopword(tok) || bag->count >= 256U) return;
+    char bounded[48];
+    snprintf(bounded, sizeof(bounded), "%.47s", tok);
     for (size_t i = 0; i < bag->count; i++) {
-        if (strcmp(bag->items[i], tok) == 0) return;
+        if (strcmp(bag->items[i], bounded) == 0) return;
     }
-    snprintf(bag->items[bag->count++], 48U, "%s", tok);
+    memcpy(bag->items[bag->count++], bounded, sizeof(bounded));
 }
 
 /* Extract deduplicated bilingual (EN + TR) ASCII-folded tokens and stems */

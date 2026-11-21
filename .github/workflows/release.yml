@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-arm64
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsqlite3-dev pkg-config
+
+      - name: Build, test, and package release tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          make clean
+          make test VERSION="${VERSION}" CFLAGS="-std=c11 -O3 -Wall -Wextra -Werror"
+          make dist VERSION="${VERSION}" CFLAGS="-std=c11 -O3 -Wall -Wextra -Werror"
+          ls -la dist/
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/hephaestus-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download packaged tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS
+        run: |
+          cd release-assets
+          sha256sum hephaestus-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release-assets/hephaestus-*.tar.gz release-assets/SHA256SUMS --clobber
+          else
+            gh release create "${TAG}" \
+              release-assets/hephaestus-*.tar.gz \
+              release-assets/SHA256SUMS \
+              --title "Hephaestus ${TAG}" \
+              --generate-notes
+          fi

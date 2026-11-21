@@ -348,6 +348,25 @@ class SliceOrganTestCase(unittest.TestCase):
         for key in ("symbol", "location", "file_tokens", "slice_tokens", "saved_pct"):
             self.assertIn(key, first)
 
+    def test_08_off_eof_file_line_and_range_clamping(self) -> None:
+        tiny = self.repo_dir / "tiny_eof.py"
+        tiny.write_text("alpha = 1\nbeta = 2\n", encoding="utf-8")
+        try:
+            p_line = self._run(self.hslice, [f"{tiny}:999999"])
+            self.assertEqual(p_line.returncode, 0, p_line.stderr)
+            self.assertIn(":1-2 [context@L2] (2/2 lines)", p_line.stdout)
+            self.assertIn("alpha = 1", p_line.stdout)
+            self.assertIn("beta = 2", p_line.stdout)
+            self.assertNotIn("999984", p_line.stdout)
+
+            p_rng = self._run(self.hslice, [f"{tiny}:999990-999999"])
+            self.assertEqual(p_rng.returncode, 0, p_rng.stderr)
+            self.assertIn(":2-2 [span] (1/2 lines)", p_rng.stdout)
+            self.assertIn("beta = 2", p_rng.stdout)
+            self.assertNotIn("999990", p_rng.stdout)
+        finally:
+            tiny.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

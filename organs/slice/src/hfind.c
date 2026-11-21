@@ -977,7 +977,7 @@ static void scan_source_buffer(
                 while (*kw == ' ') kw++;
             }
 
-            char name[128], sym[160], sig[220];
+            char name[128], sym[256], sig[220];
             uint32_t s_start = decorator_start_line ? decorator_start_line : lineno;
 
             if (strncmp(kw, "def ", 4) == 0 && is_ident0((unsigned char)kw[4])) {
@@ -1091,7 +1091,7 @@ static void scan_source_buffer(
         }
 
         if (!started_in_comment && rem > 0) {
-            char name[128], sym[160], sig[220];
+            char name[128], sym[256], sig[220];
             uint32_t matched_sid = UINT32_MAX;
             bool matched = false;
             char opened_class[160] = {0};

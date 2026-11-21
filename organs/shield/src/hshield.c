@@ -1359,7 +1359,7 @@ static void inspect_git_dir(AuditCtx *ctx, const char *git_dir) {
         }
         if (exec_bit || has_susp) {
             char msg[256];
-            snprintf(msg, sizeof(msg), "active git hook '%s' (%s)",
+            snprintf(msg, sizeof(msg), "active git hook '%.160s' (%s)",
                      name, has_susp ? "contains network/exec primitives" : "executable non-sample hook");
             record_finding(ctx, "git_hook_trap", "high", hp, msg);
         }

@@ -1516,7 +1516,12 @@ static void print_slice_block(
     const MappedFile *mf, const char *display_path, const char *label,
     uint32_t start_line, uint32_t end_line
 ) {
+    if (mf->n_lines == 0) {
+        printf("=== %s:0-0 [%s] (0/0 lines) ===\n", display_path, label ? label : "slice");
+        return;
+    }
     if (start_line < 1) start_line = 1;
+    if (start_line > mf->n_lines) start_line = mf->n_lines;
     if (end_line > mf->n_lines) end_line = mf->n_lines;
     if (end_line < start_line) end_line = start_line;
 
@@ -1788,10 +1793,14 @@ static int cmd_slice_file_line(const char *fpath, uint32_t s_line, uint32_t e_li
     if (best) {
         snprintf(zlabel, sizeof(zlabel), "%s %s", hslice_kind_label(best->kind), best->name);
         print_slice_block(&mf, disp, zlabel, best->start_line, best->end_line);
+    } else if (mf.n_lines == 0) {
+        snprintf(zlabel, sizeof(zlabel), "context@L0");
+        print_slice_block(&mf, disp, zlabel, 0, 0);
     } else {
-        uint32_t ws = (s_line > 15) ? (s_line - 15) : 1;
-        uint32_t we = (s_line + 15 <= mf.n_lines) ? (s_line + 15) : mf.n_lines;
-        snprintf(zlabel, sizeof(zlabel), "context@L%u", s_line);
+        uint32_t target = (s_line > mf.n_lines) ? mf.n_lines : (s_line < 1 ? 1 : s_line);
+        uint32_t ws = (target > 15) ? (target - 15) : 1;
+        uint32_t we = (target + 15 <= mf.n_lines) ? (target + 15) : mf.n_lines;
+        snprintf(zlabel, sizeof(zlabel), "context@L%u", target);
         print_slice_block(&mf, disp, zlabel, ws, we);
     }
     close_mapped_file(&mf);

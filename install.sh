@@ -157,6 +157,39 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+TMP_BUILD_STAGE=""
+TMP_REL=""
+TMP_SRC=""
+cleanup() {
+    [ -n "${TMP_BUILD_STAGE}" ] && rm -rf "${TMP_BUILD_STAGE}"
+    [ -n "${TMP_REL}" ] && rm -rf "${TMP_REL}"
+    [ -n "${TMP_SRC}" ] && rm -rf "${TMP_SRC}"
+    return 0
+}
+trap cleanup EXIT
+
+verify_sha256() {
+    SUM_DIR="$1"
+    SUM_FILE="$2"
+    TARGET_FILE="$3"
+    EXPECTED="$(awk -v f="${TARGET_FILE}" 'NF >= 2 { name = $2; sub(/^\*/, "", name); if (name == f) { print $1; count++ } } END { if (count != 1) exit 1 }' "${SUM_DIR}/${SUM_FILE}")" || return 1
+    case "${EXPECTED}" in
+        *[!0-9a-fA-F]*|"") return 1 ;;
+    esac
+    if [ "${#EXPECTED}" -ne 64 ]; then
+        return 1
+    fi
+    if need_cmd sha256sum; then
+        ACTUAL="$(sha256sum "${SUM_DIR}/${TARGET_FILE}" | awk '{print $1}')"
+    elif need_cmd shasum; then
+        ACTUAL="$(shasum -a 256 "${SUM_DIR}/${TARGET_FILE}" | awk '{print $1}')"
+    else
+        echo "install.sh: refusing unverified binary (neither sha256sum nor shasum found); use --from-source" >&2
+        return 1
+    fi
+    [ "$(printf '%s' "${ACTUAL}" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "${EXPECTED}" | tr '[:upper:]' '[:lower:]')" ]
+}
+
 prune_unselected_binaries() {
     if [ "${MODE}" != "only" ]; then
         return 0
@@ -234,7 +267,7 @@ install_selected_from_stage() {
 build_and_install_from_tree() {
     SRC_ROOT="$1"
     BUILD_STAGE="$(mktemp -d)"
-    trap 'rm -rf "${BUILD_STAGE}"' EXIT
+    TMP_BUILD_STAGE="${BUILD_STAGE}"
 
     if [ "${WANT_SLICE}" = "1" ]; then
         make -s -C "${SRC_ROOT}/organs/slice" BUILD_DIR="${BUILD_STAGE}"
@@ -287,14 +320,12 @@ fi
 
 if [ "${FROM_SOURCE}" != "1" ] && [ -n "${TARBALL}" ] && need_cmd curl; then
     TMP_REL="$(mktemp -d)"
-    trap 'rm -rf "${TMP_REL}"' EXIT
     BASE_URL="https://github.com/${REPO}/releases/latest/download"
     if curl -fsSL "${BASE_URL}/${TARBALL}" -o "${TMP_REL}/${TARBALL}" 2>/dev/null && \
        curl -fsSL "${BASE_URL}/SHA256SUMS" -o "${TMP_REL}/SHA256SUMS" 2>/dev/null; then
-        if need_cmd sha256sum; then
-            (cd "${TMP_REL}" && grep "${TARBALL}" SHA256SUMS | sha256sum -c - >/dev/null)
-        elif need_cmd shasum; then
-            (cd "${TMP_REL}" && grep "${TARBALL}" SHA256SUMS | shasum -a 256 -c - >/dev/null)
+        if ! verify_sha256 "${TMP_REL}" "SHA256SUMS" "${TARBALL}"; then
+            echo "install.sh: SHA-256 verification failed for ${TARBALL}" >&2
+            exit 1
         fi
         tar -xzf "${TMP_REL}/${TARBALL}" -C "${TMP_REL}"
         EXTRACTED="$(find "${TMP_REL}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
@@ -305,11 +336,11 @@ if [ "${FROM_SOURCE}" != "1" ] && [ -n "${TARBALL}" ] && need_cmd curl; then
         fi
     fi
     rm -rf "${TMP_REL}"
+    TMP_REL=""
 fi
 
 # 3. Remote source build fallback
 TMP_SRC="$(mktemp -d)"
-trap 'rm -rf "${TMP_SRC}"' EXIT
 if need_cmd git; then
     git clone --depth 1 "https://github.com/${REPO}.git" "${TMP_SRC}/hephaestus" >/dev/null 2>&1
 elif need_cmd curl; then

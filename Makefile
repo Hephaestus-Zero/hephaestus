@@ -1,4 +1,4 @@
-VERSION   := 0.1.0
+VERSION   ?= 0.1.0
 CC        ?= cc
 CFLAGS    ?= -std=c11 -O3 -Wall -Wextra
 PREFIX    ?= /usr/local
@@ -25,8 +25,8 @@ all: organs $(BUILD_DIR)/hephaestus
 
 organs:
 	@mkdir -p "$(BUILD_DIR)"
-	@for organ in $(ORGANS); do \
-		$(MAKE) --no-print-directory -C "organs/$$organ" BUILD_DIR="$(BUILD_DIR)" CC="$(CC)" CFLAGS="$(CFLAGS)"; \
+	@set -e; for organ in $(ORGANS); do \
+		$(MAKE) --no-print-directory -C "organs/$$organ" BUILD_DIR="$(BUILD_DIR)" CC="$(CC)" CFLAGS="$(CFLAGS)" || exit 1; \
 	done
 
 $(BUILD_DIR)/hephaestus: bin/hephaestus
@@ -34,8 +34,8 @@ $(BUILD_DIR)/hephaestus: bin/hephaestus
 	install -m 0755 bin/hephaestus "$(BUILD_DIR)/hephaestus"
 
 test: all
-	@for organ in $(ORGANS); do \
-		$(MAKE) --no-print-directory -C "organs/$$organ" test BUILD_DIR="$(BUILD_DIR)" CC="$(CC)" CFLAGS="$(CFLAGS)"; \
+	@set -e; for organ in $(ORGANS); do \
+		$(MAKE) --no-print-directory -C "organs/$$organ" test BUILD_DIR="$(BUILD_DIR)" CC="$(CC)" CFLAGS="$(CFLAGS)" || exit 1; \
 	done
 	PYTHONDONTWRITEBYTECODE=1 HEPHAESTUS_BIN_DIR="$(BUILD_DIR)" python3 -B -m unittest discover -s tests -p "test_*.py" -v
 
@@ -75,21 +75,33 @@ dist: all
 	@rm -rf "$(DIST_DIR)/$(DIST_STEM)"
 	@mkdir -p "$(DIST_DIR)/$(DIST_STEM)/bin" "$(DIST_DIR)/$(DIST_STEM)/mcp" "$(DIST_DIR)/$(DIST_STEM)/skills"
 	install -m 0755 bin/hephaestus "$(DIST_DIR)/$(DIST_STEM)/bin/hephaestus"
-	install -m 0755 "$(BUILD_DIR)/hslice" "$(DIST_DIR)/$(DIST_STEM)/bin/hslice"
-	install -m 0755 "$(BUILD_DIR)/hfind" "$(DIST_DIR)/$(DIST_STEM)/bin/hfind"
-	ln -sf hfind "$(DIST_DIR)/$(DIST_STEM)/bin/hsearch"
-	install -m 0755 "$(BUILD_DIR)/hshield" "$(DIST_DIR)/$(DIST_STEM)/bin/hshield"
-	install -m 0755 "$(BUILD_DIR)/hhook" "$(DIST_DIR)/$(DIST_STEM)/bin/hhook"
-	install -m 0755 "$(BUILD_DIR)/hverify" "$(DIST_DIR)/$(DIST_STEM)/bin/hverify"
-	install -m 0755 "$(BUILD_DIR)/hmemory" "$(DIST_DIR)/$(DIST_STEM)/bin/hmemory"
-	install -m 0755 "$(BUILD_DIR)/hvoice" "$(DIST_DIR)/$(DIST_STEM)/bin/hvoice"
+	@if [ -x "$(BUILD_DIR)/hslice" ]; then \
+		install -m 0755 "$(BUILD_DIR)/hslice" "$(DIST_DIR)/$(DIST_STEM)/bin/hslice"; \
+		install -m 0755 "$(BUILD_DIR)/hfind" "$(DIST_DIR)/$(DIST_STEM)/bin/hfind"; \
+		ln -sf hfind "$(DIST_DIR)/$(DIST_STEM)/bin/hsearch"; \
+	fi
+	@if [ -x "$(BUILD_DIR)/hshield" ]; then \
+		install -m 0755 "$(BUILD_DIR)/hshield" "$(DIST_DIR)/$(DIST_STEM)/bin/hshield"; \
+		install -m 0755 "$(BUILD_DIR)/hhook" "$(DIST_DIR)/$(DIST_STEM)/bin/hhook"; \
+	fi
+	@if [ -x "$(BUILD_DIR)/hverify" ]; then \
+		install -m 0755 "$(BUILD_DIR)/hverify" "$(DIST_DIR)/$(DIST_STEM)/bin/hverify"; \
+	fi
+	@if [ -x "$(BUILD_DIR)/hmemory" ]; then \
+		install -m 0755 "$(BUILD_DIR)/hmemory" "$(DIST_DIR)/$(DIST_STEM)/bin/hmemory"; \
+	fi
+	@if [ -x "$(BUILD_DIR)/hvoice" ]; then \
+		install -m 0755 "$(BUILD_DIR)/hvoice" "$(DIST_DIR)/$(DIST_STEM)/bin/hvoice"; \
+	fi
 	install -m 0755 mcp/hephaestus_mcp.py "$(DIST_DIR)/$(DIST_STEM)/mcp/hephaestus_mcp.py"
 	install -m 0755 install.sh "$(DIST_DIR)/$(DIST_STEM)/install.sh"
 	install -m 0644 LICENSE "$(DIST_DIR)/$(DIST_STEM)/LICENSE"
 	@if [ -f README.md ]; then install -m 0644 README.md "$(DIST_DIR)/$(DIST_STEM)/README.md"; fi
-	@for organ in slice shield verify memory voice; do \
-		mkdir -p "$(DIST_DIR)/$(DIST_STEM)/skills/$$organ"; \
-		install -m 0644 "skills/$$organ/SKILL.md" "$(DIST_DIR)/$(DIST_STEM)/skills/$$organ/SKILL.md"; \
+	@set -e; for organ in $(ORGANS); do \
+		if [ -f "skills/$$organ/SKILL.md" ]; then \
+			mkdir -p "$(DIST_DIR)/$(DIST_STEM)/skills/$$organ"; \
+			install -m 0644 "skills/$$organ/SKILL.md" "$(DIST_DIR)/$(DIST_STEM)/skills/$$organ/SKILL.md"; \
+		fi; \
 	done
 	tar -czf "$(DIST_DIR)/$(DIST_STEM).tar.gz" -C "$(DIST_DIR)" "$(DIST_STEM)"
 	@rm -rf "$(DIST_DIR)/$(DIST_STEM)"
